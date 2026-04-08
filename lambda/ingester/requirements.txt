@@ -1,0 +1,3 @@
+# boto3 and urllib3 are included in the Lambda Python 3.11 runtime.
+# No additional dependencies required for the ingester.
+urllib3>=2.0.0

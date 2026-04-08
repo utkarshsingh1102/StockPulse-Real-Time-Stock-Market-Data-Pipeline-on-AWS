@@ -1,0 +1,17 @@
+{
+  "symbols": [
+    "AAPL",
+    "MSFT",
+    "GOOGL",
+    "AMZN",
+    "TSLA",
+    "META",
+    "NVDA",
+    "JPM",
+    "V",
+    "JNJ"
+  ],
+  "description": "MVP tracked symbols — top 10 US equities by market cap / relevance",
+  "kinesis_stream": "stockpulse-stream",
+  "s3_bucket": "stockpulse-data"
+}

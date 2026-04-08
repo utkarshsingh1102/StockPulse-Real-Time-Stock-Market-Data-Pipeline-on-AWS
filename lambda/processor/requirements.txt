@@ -1,0 +1,15 @@
+# PyArrow is NOT included in the Lambda runtime.
+# It must be provided as a Lambda Layer built for Amazon Linux 2.
+#
+# Build instructions:
+#   docker run -v $(pwd):/output amazonlinux:2 bash -c \
+#     "yum install -y python3-pip && pip3 install pyarrow==14.0.2 -t /output/python/"
+#   zip -r pyarrow-layer.zip python/
+#   aws lambda publish-layer-version \
+#     --layer-name stockpulse-pyarrow \
+#     --zip-file fileb://pyarrow-layer.zip \
+#     --compatible-runtimes python3.11 \
+#     --compatible-architectures x86_64
+#
+# This file is for local development/testing only.
+pyarrow>=14.0.2

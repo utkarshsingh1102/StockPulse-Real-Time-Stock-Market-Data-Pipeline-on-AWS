@@ -1,0 +1,357 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_STOCKPULSE",
+      "label": "StockPulse API",
+      "description": "JSON API datasource pointing to API Gateway / Lambda query endpoint",
+      "type": "datasource",
+      "pluginId": "marcusolsson-json-datasource",
+      "pluginName": "JSON API"
+    }
+  ],
+  "__requires": [
+    {
+      "type": "grafana",
+      "id": "grafana",
+      "name": "Grafana",
+      "version": "10.0.0"
+    },
+    {
+      "type": "datasource",
+      "id": "marcusolsson-json-datasource",
+      "name": "JSON API",
+      "version": "1.3.6"
+    },
+    {
+      "type": "panel",
+      "id": "timeseries",
+      "name": "Time series",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "barchart",
+      "name": "Bar chart",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "table",
+      "name": "Table",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "gauge",
+      "name": "Gauge",
+      "version": ""
+    },
+    {
+      "type": "panel",
+      "id": "stat",
+      "name": "Stat",
+      "version": ""
+    }
+  ],
+  "annotations": {
+    "list": []
+  },
+  "description": "StockPulse — Real-Time Stock Market Data Pipeline on AWS",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Close Price — All Symbols",
+      "type": "timeseries",
+      "description": "1-minute close price for all tracked symbols",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "spanNulls": false
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "desc" },
+        "legend": { "displayMode": "table", "placement": "bottom", "calcs": ["last", "max", "min"] }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+          "fields": [
+            { "jsonPath": "$.data[*].event_time", "name": "Time", "type": "time" },
+            { "jsonPath": "$.data[*].close", "name": "Close", "type": "number" },
+            { "jsonPath": "$.data[*].symbol", "name": "Symbol", "type": "string" }
+          ],
+          "method": "GET",
+          "queryParams": "action=ohlcv&symbols=AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ&interval=1min",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Volume by Symbol",
+      "type": "barchart",
+      "description": "Trading volume per symbol for current session",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 9 },
+      "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "fillOpacity": 80 }
+        },
+        "overrides": []
+      },
+      "options": {
+        "orientation": "auto",
+        "groupWidth": 0.7,
+        "barWidth": 0.97,
+        "tooltip": { "mode": "single", "sort": "none" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+          "fields": [
+            { "jsonPath": "$.data[*].symbol", "name": "Symbol", "type": "string" },
+            { "jsonPath": "$.data[*].total_volume", "name": "Volume", "type": "number" }
+          ],
+          "method": "GET",
+          "queryParams": "action=volume_summary",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Top Movers Today",
+      "type": "table",
+      "description": "Symbols ranked by price change % (most volatile first)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 9 },
+      "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto" } },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "price_change_pct" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "decimals", "value": 2 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "red", "value": null },
+                    { "color": "yellow", "value": -1 },
+                    { "color": "green", "value": 0 }
+                  ]
+                }
+              },
+              { "id": "custom.displayMode", "value": "color-background" }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "close" },
+            "properties": [
+              { "id": "unit", "value": "currencyUSD" },
+              { "id": "decimals", "value": 2 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "sortBy": [{ "displayName": "price_change_pct", "desc": true }]
+      },
+      "targets": [
+        {
+          "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+          "fields": [
+            { "jsonPath": "$.data[*].symbol", "name": "Symbol", "type": "string" },
+            { "jsonPath": "$.data[*].close", "name": "close", "type": "number" },
+            { "jsonPath": "$.data[*].price_change_pct", "name": "price_change_pct", "type": "number" },
+            { "jsonPath": "$.data[*].total_volume", "name": "Volume", "type": "number" }
+          ],
+          "method": "GET",
+          "queryParams": "action=top_movers",
+          "refId": "C"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Pipeline Latency (ms)",
+      "type": "gauge",
+      "description": "Avg time from market bar timestamp to S3 ingestion (ms). Target: < 90,000 ms (90s)",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 17 },
+      "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "min": 0,
+          "max": 120000,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 60000 },
+              { "color": "red", "value": 90000 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+          "fields": [
+            { "jsonPath": "$.data.avg_latency_ms", "name": "Avg Latency", "type": "number" }
+          ],
+          "method": "GET",
+          "queryParams": "action=latency",
+          "refId": "D"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Records Ingested Today",
+      "type": "stat",
+      "description": "Total OHLCV bars written to S3 and processed by Glue today",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 17 },
+      "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "green", "value": 100 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "background",
+        "graphMode": "area"
+      },
+      "targets": [
+        {
+          "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+          "fields": [
+            { "jsonPath": "$.data.record_count", "name": "Records Today", "type": "number" }
+          ],
+          "method": "GET",
+          "queryParams": "action=record_count",
+          "refId": "E"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "OHLC Candlestick — Select Symbol",
+      "type": "timeseries",
+      "description": "OHLC bars for selected symbol (use the Symbol variable above)",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 17 },
+      "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "decimals": 2,
+          "custom": { "lineWidth": 1 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "High" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Low" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "tooltip": { "mode": "multi", "sort": "none" },
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+          "fields": [
+            { "jsonPath": "$.data[*].event_time", "name": "Time", "type": "time" },
+            { "jsonPath": "$.data[*].open", "name": "Open", "type": "number" },
+            { "jsonPath": "$.data[*].high", "name": "High", "type": "number" },
+            { "jsonPath": "$.data[*].low", "name": "Low", "type": "number" },
+            { "jsonPath": "$.data[*].close", "name": "Close", "type": "number" }
+          ],
+          "method": "GET",
+          "queryParams": "action=ohlcv&symbols=${symbol}&interval=1min",
+          "refId": "F"
+        }
+      ]
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 38,
+  "tags": ["stockpulse", "aws", "data-engineering", "stocks"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "AAPL", "value": "AAPL" },
+        "datasource": { "type": "marcusolsson-json-datasource", "uid": "${DS_STOCKPULSE}" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Symbol",
+        "multi": false,
+        "name": "symbol",
+        "options": [
+          { "selected": true,  "text": "AAPL",  "value": "AAPL" },
+          { "selected": false, "text": "MSFT",  "value": "MSFT" },
+          { "selected": false, "text": "GOOGL", "value": "GOOGL" },
+          { "selected": false, "text": "AMZN",  "value": "AMZN" },
+          { "selected": false, "text": "TSLA",  "value": "TSLA" },
+          { "selected": false, "text": "META",  "value": "META" },
+          { "selected": false, "text": "NVDA",  "value": "NVDA" },
+          { "selected": false, "text": "JPM",   "value": "JPM"  },
+          { "selected": false, "text": "V",     "value": "V"    },
+          { "selected": false, "text": "JNJ",   "value": "JNJ"  }
+        ],
+        "query": "",
+        "type": "custom"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {},
+  "timezone": "America/New_York",
+  "title": "StockPulse — Live Market Data",
+  "uid": "stockpulse-main",
+  "version": 1
+}
