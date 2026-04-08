@@ -107,6 +107,11 @@ if aws lambda get-function \
     --function-name "stockpulse-ingester" \
     --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
     --region "$AWS_REGION"
+
+  aws lambda tag-resource \
+    --resource "arn:aws:lambda:$AWS_REGION:$ACCOUNT_ID:function:stockpulse-ingester" \
+    --tags "project-name=StockPulse" \
+    --region "$AWS_REGION"
 else
   echo "  Creating ingester Lambda..."
   aws lambda create-function \
@@ -119,6 +124,7 @@ else
     --memory-size 256 \
     --description "StockPulse: fetches Polygon.io data and publishes to Kinesis" \
     --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
+    --tags "project-name=StockPulse" \
     --region "$AWS_REGION"
 fi
 
@@ -194,6 +200,11 @@ if aws lambda get-function \
     --layers "$LAYER_ARN" \
     --environment "{\"Variables\":{\"S3_BUCKET\":\"$S3_BUCKET\"}}" \
     --region "$AWS_REGION"
+
+  aws lambda tag-resource \
+    --resource "arn:aws:lambda:$AWS_REGION:$ACCOUNT_ID:function:stockpulse-processor" \
+    --tags "project-name=StockPulse" \
+    --region "$AWS_REGION"
 else
   echo "  Creating processor Lambda..."
   aws lambda create-function \
@@ -207,6 +218,7 @@ else
     --description "StockPulse: consumes Kinesis, writes Parquet to S3" \
     --layers "$LAYER_ARN" \
     --environment "{\"Variables\":{\"S3_BUCKET\":\"$S3_BUCKET\"}}" \
+    --tags "project-name=StockPulse" \
     --region "$AWS_REGION"
 fi
 

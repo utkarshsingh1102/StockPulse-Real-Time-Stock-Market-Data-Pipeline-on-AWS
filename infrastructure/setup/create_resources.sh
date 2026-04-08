@@ -32,6 +32,7 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # ---------------------------------------------------------------------------
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+PROJECT_TAG="project-name=StockPulse"
 S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
 S3_SCRIPTS_BUCKET="${S3_SCRIPTS_BUCKET:-stockpulse-scripts-us}"
 KINESIS_STREAM="${KINESIS_STREAM:-stockpulse-stream}"
@@ -68,6 +69,13 @@ for bucket in "$S3_BUCKET" "$S3_SCRIPTS_BUCKET"; do
     fi
     echo "  Created s3://$bucket"
   fi
+done
+
+# Tag both buckets
+for bucket in "$S3_BUCKET" "$S3_SCRIPTS_BUCKET"; do
+  aws s3api put-bucket-tagging \
+    --bucket "$bucket" \
+    --tagging 'TagSet=[{Key=project-name,Value=StockPulse}]'
 done
 
 # Versioning
@@ -142,7 +150,8 @@ create_role_if_not_exists() {
     aws iam create-role \
       --role-name "$role_name" \
       --assume-role-policy-document "$trust_doc" \
-      --description "StockPulse: $role_name"
+      --description "StockPulse: $role_name" \
+      --tags Key=project-name,Value=StockPulse
     echo "  Created role: $role_name"
   fi
 }
@@ -283,6 +292,12 @@ else
   echo "  Kinesis stream '$KINESIS_STREAM' created (1 shard, 24h retention, SSE enabled)."
 fi
 
+# Tag the stream
+aws kinesis add-tags-to-stream \
+  --stream-name "$KINESIS_STREAM" \
+  --tags project-name=StockPulse \
+  --region "$AWS_REGION" 2>/dev/null || true
+
 # Set retention to 24 hours (default is already 24h, but be explicit)
 aws kinesis increase-stream-retention-period \
   --stream-name "$KINESIS_STREAM" \
@@ -314,6 +329,11 @@ DLQ_ARN=$(aws sqs get-queue-attributes \
   --output text \
   --region "$AWS_REGION")
 
+aws sqs tag-queue \
+  --queue-url "$DLQ_URL" \
+  --tags project-name=StockPulse \
+  --region "$AWS_REGION"
+
 echo "  SQS DLQ created: $DLQ_ARN"
 
 # ---------------------------------------------------------------------------
@@ -324,6 +344,7 @@ echo "[5/9] Creating SNS topic for alerts..."
 
 SNS_ARN=$(aws sns create-topic \
   --name "$SNS_TOPIC_NAME" \
+  --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION" \
   --query TopicArn \
   --output text)
@@ -352,6 +373,7 @@ aws cloudwatch put-metric-alarm \
   --evaluation-periods 1 \
   --alarm-actions "$SNS_ARN" \
   --treat-missing-data notBreaching \
+  --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
 # Alarm 2: Lambda Processor errors
@@ -368,6 +390,7 @@ aws cloudwatch put-metric-alarm \
   --evaluation-periods 1 \
   --alarm-actions "$SNS_ARN" \
   --treat-missing-data notBreaching \
+  --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
 # Alarm 3: Kinesis iterator age > 60s (consumer falling behind)
@@ -384,6 +407,7 @@ aws cloudwatch put-metric-alarm \
   --evaluation-periods 2 \
   --alarm-actions "$SNS_ARN" \
   --treat-missing-data notBreaching \
+  --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
 # Alarm 4: Lambda Ingester throttles
@@ -400,6 +424,7 @@ aws cloudwatch put-metric-alarm \
   --evaluation-periods 1 \
   --alarm-actions "$SNS_ARN" \
   --treat-missing-data notBreaching \
+  --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
 # Alarm 5: DLQ has messages (failed records)
@@ -416,6 +441,7 @@ aws cloudwatch put-metric-alarm \
   --evaluation-periods 1 \
   --alarm-actions "$SNS_ARN" \
   --treat-missing-data notBreaching \
+  --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
 echo "  5 CloudWatch alarms created."
@@ -428,6 +454,7 @@ echo "[7/9] Creating Glue Data Catalog database..."
 
 aws glue create-database \
   --database-input Name="$GLUE_DB",Description="StockPulse processed OHLCV data" \
+  --tags '{"project-name":"StockPulse"}' \
   --region "$AWS_REGION" 2>/dev/null || echo "  Glue database '$GLUE_DB' already exists — skipping"
 
 echo "  Glue database: $GLUE_DB"
@@ -439,12 +466,20 @@ echo ""
 echo "[8/9] Creating EventBridge rule (will be activated after Lambda is deployed)..."
 
 # Note: This rule is created DISABLED — enable after deploying Lambda ingester
-aws events put-rule \
+RULE_ARN=$(aws events put-rule \
   --name "stockpulse-ingester-schedule" \
   --schedule-expression "cron(*/1 14-20 ? * MON-FRI *)" \
   --description "Triggers StockPulse ingester every minute during market hours (Mon-Fri 9:30-4:00 ET / 14:30-21:00 UTC)" \
   --state DISABLED \
-  --region "$AWS_REGION" 2>/dev/null || echo "  EventBridge rule already exists — skipping"
+  --region "$AWS_REGION" \
+  --query RuleArn --output text 2>/dev/null) || echo "  EventBridge rule already exists — skipping"
+
+if [ -n "${RULE_ARN:-}" ]; then
+  aws events tag-resource \
+    --resource-arn "$RULE_ARN" \
+    --tags Key=project-name,Value=StockPulse \
+    --region "$AWS_REGION" 2>/dev/null || true
+fi
 
 echo "  EventBridge rule created (DISABLED — enable after Lambda deployment)."
 echo "  To enable: aws events enable-rule --name stockpulse-ingester-schedule --region $AWS_REGION"
