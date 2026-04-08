@@ -2,15 +2,18 @@
 # StockPulse — Upload Glue PySpark script to S3 and create/update the Glue job.
 set -euo pipefail
 
-AWS_REGION="${AWS_REGION:-us-east-1}"
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-S3_SCRIPTS_BUCKET="stockpulse-scripts"
-S3_BUCKET="stockpulse-data"
-GLUE_JOB_NAME="stockpulse-ohlcv-transform"
-GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/stockpulse-glue-role"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Load .env (gitignored) — keeps config out of version control.
+[ -f "$PROJECT_ROOT/.env" ] && set -a && source "$PROJECT_ROOT/.env" && set +a
+
+AWS_REGION="${AWS_REGION:-us-east-1}"
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+S3_SCRIPTS_BUCKET="${S3_SCRIPTS_BUCKET:-stockpulse-scripts-us}"
+S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
+GLUE_JOB_NAME="${GLUE_JOB_NAME:-stockpulse-ohlcv-transform}"
+GLUE_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/stockpulse-glue-role"
 GLUE_SCRIPT="$PROJECT_ROOT/glue/ohlcv_transform.py"
 S3_SCRIPT_PATH="s3://$S3_SCRIPTS_BUCKET/glue/ohlcv_transform.py"
 

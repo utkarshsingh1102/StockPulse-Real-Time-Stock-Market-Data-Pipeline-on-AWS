@@ -20,19 +20,27 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------------------
-# Configuration — edit these if needed
+# Load .env (gitignored) so secrets and config are never hardcoded here.
+# All variables below fall back to sensible defaults if .env is absent.
+# ---------------------------------------------------------------------------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+[ -f "$PROJECT_ROOT/.env" ] && set -a && source "$PROJECT_ROOT/.env" && set +a
+
+# ---------------------------------------------------------------------------
+# Configuration (values come from .env; defaults shown as fallbacks)
 # ---------------------------------------------------------------------------
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-S3_BUCKET="stockpulse-data"
-S3_SCRIPTS_BUCKET="stockpulse-scripts"
-KINESIS_STREAM="stockpulse-stream"
-DLQ_NAME="stockpulse-dlq"
-SNS_TOPIC_NAME="stockpulse-alerts"
-GLUE_DB="stockpulse_db"
-LAMBDA_INGESTER_NAME="stockpulse-ingester"
-LAMBDA_PROCESSOR_NAME="stockpulse-processor"
-GLUE_JOB_NAME="stockpulse-ohlcv-transform"
+S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
+S3_SCRIPTS_BUCKET="${S3_SCRIPTS_BUCKET:-stockpulse-scripts-us}"
+KINESIS_STREAM="${KINESIS_STREAM:-stockpulse-stream}"
+DLQ_NAME="${DLQ_NAME:-stockpulse-dlq}"
+SNS_TOPIC_NAME="${SNS_TOPIC_NAME:-stockpulse-alerts}"
+GLUE_DB="${GLUE_DB:-stockpulse_db}"
+LAMBDA_INGESTER_NAME="${LAMBDA_INGESTER_NAME:-stockpulse-ingester}"
+LAMBDA_PROCESSOR_NAME="${LAMBDA_PROCESSOR_NAME:-stockpulse-processor}"
+GLUE_JOB_NAME="${GLUE_JOB_NAME:-stockpulse-ohlcv-transform}"
 
 echo "============================================================"
 echo "StockPulse — AWS Infrastructure Setup"

@@ -12,6 +12,5 @@
     "JNJ"
   ],
   "description": "MVP tracked symbols — top 10 US equities by market cap / relevance",
-  "kinesis_stream": "stockpulse-stream",
-  "s3_bucket": "stockpulse-data"
+  "note": "Infrastructure config (bucket names, stream names, keys) lives in .env / config/settings.py"
 }

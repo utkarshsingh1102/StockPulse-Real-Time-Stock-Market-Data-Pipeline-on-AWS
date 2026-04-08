@@ -9,8 +9,8 @@ Workers:     2
 
 Job parameters (passed via --job-bookmark-option and --args):
   --JOB_NAME        stockpulse-ohlcv-transform
-  --S3_INPUT_PATH   s3://stockpulse-data/raw/
-  --S3_OUTPUT_PATH  s3://stockpulse-data/processed/
+  --S3_INPUT_PATH   s3://stockpulse-data-us/raw/
+  --S3_OUTPUT_PATH  s3://stockpulse-data-us/processed/
 
 Run via AWS console, Glue trigger, or:
   aws glue start-job-run --job-name stockpulse-ohlcv-transform
@@ -39,8 +39,8 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
-S3_INPUT_PATH = args["S3_INPUT_PATH"]   # e.g. s3://stockpulse-data/raw/
-S3_OUTPUT_PATH = args["S3_OUTPUT_PATH"] # e.g. s3://stockpulse-data/processed/
+S3_INPUT_PATH = args["S3_INPUT_PATH"]   # e.g. s3://stockpulse-data-us/raw/
+S3_OUTPUT_PATH = args["S3_OUTPUT_PATH"] # e.g. s3://stockpulse-data-us/processed/
 
 print(f"Reading raw data from: {S3_INPUT_PATH}")
 print(f"Writing processed data to: {S3_OUTPUT_PATH}")

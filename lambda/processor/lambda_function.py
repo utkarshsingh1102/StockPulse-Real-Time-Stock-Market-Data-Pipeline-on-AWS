@@ -4,7 +4,7 @@ Consumes records from Kinesis Data Streams, converts them to Parquet,
 and writes to S3 raw zone with Hive-style partitioning.
 
 Trigger:     Amazon Kinesis Data Stream (batch size: 100, LATEST)
-Destination: Amazon S3 s3://stockpulse-data/raw/year=YYYY/month=MM/day=DD/
+Destination: Amazon S3 s3://stockpulse-data-us/raw/year=YYYY/month=MM/day=DD/
 Failure:     SQS Dead Letter Queue (stockpulse-dlq) via OnFailure destination
 
 Lambda Layer required: PyArrow (built for Amazon Linux 2)

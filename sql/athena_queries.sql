@@ -1,6 +1,6 @@
 -- StockPulse — Athena Validation Queries
 -- Database: stockpulse_db  |  Table: sp_processed
--- Output location: s3://stockpulse-data/athena-results/
+-- Output location: s3://stockpulse-data-us/athena-results/
 --
 -- Run these after each Glue job + Crawler to validate processed data.
 

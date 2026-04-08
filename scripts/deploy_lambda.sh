@@ -14,18 +14,21 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Load .env (gitignored) — keeps secrets out of this script and version control.
+[ -f "$PROJECT_ROOT/.env" ] && set -a && source "$PROJECT_ROOT/.env" && set +a
+
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-POLYGON_API_KEY="${POLYGON_API_KEY:?ERROR: POLYGON_API_KEY environment variable is required}"
-KINESIS_STREAM="stockpulse-stream"
-S3_BUCKET="stockpulse-data"
-SYMBOLS="AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ"
+POLYGON_SECRET_NAME="${POLYGON_SECRET_NAME:-stockpulse/polygon-api-key}"
+KINESIS_STREAM="${KINESIS_STREAM:-stockpulse-stream}"
+S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
+SYMBOLS="${SYMBOLS:-AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ}"
 
 INGESTER_ROLE="arn:aws:iam::$ACCOUNT_ID:role/stockpulse-ingester-role"
 PROCESSOR_ROLE="arn:aws:iam::$ACCOUNT_ID:role/stockpulse-processor-role"
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 BUILD_DIR="$PROJECT_ROOT/.build"
 
 mkdir -p "$BUILD_DIR"
@@ -52,11 +55,12 @@ else
   mkdir -p "$LAYER_DIR"
 
   docker run --rm \
+    --entrypoint bash \
     -v "$LAYER_DIR:/output" \
-    amazonlinux:2 \
-    bash -c "yum install -y python3-pip zip && \
-             pip3 install 'pyarrow==14.0.2' -t /output/python/ && \
-             echo 'PyArrow installed successfully'"
+    public.ecr.aws/lambda/python:3.11 \
+    -c "pip install --upgrade pip && \
+        pip install --only-binary=:all: 'pyarrow==14.0.2' -t /output/python/ && \
+        echo 'PyArrow installed successfully'"
 
   (cd "$LAYER_DIR" && zip -r "$LAYER_ZIP" python/)
   echo "  Layer zip created: $LAYER_ZIP"
@@ -101,11 +105,7 @@ if aws lambda get-function \
 
   aws lambda update-function-configuration \
     --function-name "stockpulse-ingester" \
-    --environment "Variables={
-      POLYGON_API_KEY=$POLYGON_API_KEY,
-      KINESIS_STREAM_NAME=$KINESIS_STREAM,
-      SYMBOLS=$SYMBOLS
-    }" \
+    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
     --region "$AWS_REGION"
 else
   echo "  Creating ingester Lambda..."
@@ -118,12 +118,29 @@ else
     --timeout 60 \
     --memory-size 256 \
     --description "StockPulse: fetches Polygon.io data and publishes to Kinesis" \
-    --environment "Variables={
-      POLYGON_API_KEY=$POLYGON_API_KEY,
-      KINESIS_STREAM_NAME=$KINESIS_STREAM,
-      SYMBOLS=$SYMBOLS
-    }" \
+    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
     --region "$AWS_REGION"
+fi
+
+# Grant the ingester role permission to read the secret
+SECRET_ARN=$(aws secretsmanager describe-secret \
+  --secret-id "$POLYGON_SECRET_NAME" \
+  --region "$AWS_REGION" \
+  --query ARN --output text 2>/dev/null || true)
+
+if [ -n "$SECRET_ARN" ]; then
+  aws iam put-role-policy \
+    --role-name stockpulse-ingester-role \
+    --policy-name SecretsManagerReadPolicy \
+    --policy-document "{
+      \"Version\": \"2012-10-17\",
+      \"Statement\": [{
+        \"Effect\": \"Allow\",
+        \"Action\": \"secretsmanager:GetSecretValue\",
+        \"Resource\": \"$SECRET_ARN\"
+      }]
+    }"
+  echo "  IAM policy granted: ingester-role → $POLYGON_SECRET_NAME"
 fi
 
 # Wire up EventBridge rule to ingester
@@ -175,7 +192,7 @@ if aws lambda get-function \
   aws lambda update-function-configuration \
     --function-name "stockpulse-processor" \
     --layers "$LAYER_ARN" \
-    --environment "Variables={S3_BUCKET=$S3_BUCKET}" \
+    --environment "{\"Variables\":{\"S3_BUCKET\":\"$S3_BUCKET\"}}" \
     --region "$AWS_REGION"
 else
   echo "  Creating processor Lambda..."
@@ -189,7 +206,7 @@ else
     --memory-size 512 \
     --description "StockPulse: consumes Kinesis, writes Parquet to S3" \
     --layers "$LAYER_ARN" \
-    --environment "Variables={S3_BUCKET=$S3_BUCKET}" \
+    --environment "{\"Variables\":{\"S3_BUCKET\":\"$S3_BUCKET\"}}" \
     --region "$AWS_REGION"
 fi
 

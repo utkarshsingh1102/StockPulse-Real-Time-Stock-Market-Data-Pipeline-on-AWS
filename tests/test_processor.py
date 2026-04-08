@@ -18,7 +18,11 @@ from unittest.mock import MagicMock, patch
 boto3_mock = MagicMock()
 sys.modules["boto3"] = boto3_mock
 
-os.environ.setdefault("S3_BUCKET", "stockpulse-data")
+# Load central config (reads .env automatically in local dev)
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import settings  # noqa: E402
+
+os.environ.setdefault("S3_BUCKET", settings.S3_BUCKET)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "lambda", "processor"))
 import lambda_function  # noqa: E402
@@ -120,7 +124,7 @@ class TestWriteParquetToS3(unittest.TestCase):
         lambda_function._write_parquet_to_s3(table, "raw/year=2024/month=01/day=15/test.parquet")
 
         call_args = lambda_function.s3_client.put_object.call_args[1]
-        self.assertEqual(call_args["Bucket"], "stockpulse-data")
+        self.assertEqual(call_args["Bucket"], settings.S3_BUCKET)
         self.assertEqual(call_args["Key"], "raw/year=2024/month=01/day=15/test.parquet")
 
         # Verify the body is valid Parquet

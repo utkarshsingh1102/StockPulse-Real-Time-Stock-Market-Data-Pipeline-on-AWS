@@ -18,23 +18,34 @@ import urllib3
 # ---------------------------------------------------------------------------
 # Configuration (all values come from Lambda environment variables)
 # ---------------------------------------------------------------------------
-POLYGON_API_KEY = os.environ["POLYGON_API_KEY"]
 KINESIS_STREAM_NAME = os.environ.get("KINESIS_STREAM_NAME", "stockpulse-stream")
 SYMBOLS = os.environ.get(
     "SYMBOLS", "AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ"
 ).split(",")
+POLYGON_SECRET_NAME = os.environ.get("POLYGON_SECRET_NAME", "stockpulse/polygon-api-key")
 
 BASE_URL = "https://api.polygon.io"
-SNAPSHOT_URL = (
-    f"{BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers"
-    f"?tickers={','.join(SYMBOLS)}&apiKey={POLYGON_API_KEY}"
-)
 
 # ---------------------------------------------------------------------------
 # AWS clients (initialised once outside handler for connection reuse)
 # ---------------------------------------------------------------------------
 kinesis_client = boto3.client("kinesis")
+secrets_client = boto3.client("secretsmanager")
 http = urllib3.PoolManager(timeout=urllib3.Timeout(connect=5.0, read=10.0))
+
+
+def _get_polygon_api_key() -> str:
+    """Fetch the Polygon.io API key from AWS Secrets Manager at cold-start."""
+    secret = secrets_client.get_secret_value(SecretId=POLYGON_SECRET_NAME)
+    return json.loads(secret["SecretString"])["POLYGON_API_KEY"]
+
+
+# Fetched once per Lambda container lifetime (cached across warm invocations)
+POLYGON_API_KEY = _get_polygon_api_key()
+SNAPSHOT_URL = (
+    f"{BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers"
+    f"?tickers={','.join(SYMBOLS)}&apiKey={POLYGON_API_KEY}"
+)
 
 
 def _fetch_snapshot() -> list[dict]:

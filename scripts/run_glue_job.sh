@@ -2,8 +2,12 @@
 # StockPulse — Trigger the Glue ETL job and tail its status.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+[ -f "$PROJECT_ROOT/.env" ] && set -a && source "$PROJECT_ROOT/.env" && set +a
+
 AWS_REGION="${AWS_REGION:-us-east-1}"
-GLUE_JOB_NAME="stockpulse-ohlcv-transform"
+GLUE_JOB_NAME="${GLUE_JOB_NAME:-stockpulse-ohlcv-transform}"
 
 echo "Starting Glue job: $GLUE_JOB_NAME"
 
