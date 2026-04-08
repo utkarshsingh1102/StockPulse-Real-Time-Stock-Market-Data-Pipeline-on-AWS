@@ -3,6 +3,7 @@ __pycache__/
 *.pyo
 .env
 .env.*
+!.env.example
 *.zip
 *.egg-info/
 dist/
