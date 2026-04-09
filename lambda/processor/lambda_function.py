@@ -1,18 +1,17 @@
 """
 StockPulse — Lambda Processor
-Consumes records from Kinesis Data Streams, converts them to Parquet,
+Consumes records from SQS, converts them to Parquet,
 and writes to S3 raw zone with Hive-style partitioning.
 
-Trigger:     Amazon Kinesis Data Stream (batch size: 100, LATEST)
+Trigger:     Amazon SQS (stockpulse-queue, batch size: 10)
 Destination: Amazon S3 s3://stockpulse-data-us/raw/year=YYYY/month=MM/day=DD/
-Failure:     SQS Dead Letter Queue (stockpulse-dlq) via OnFailure destination
+Failure:     SQS Dead Letter Queue (stockpulse-dlq) via queue redrive policy
 
 Lambda Layer required: PyArrow (built for Amazon Linux 2)
   docker run -v $(pwd):/output amazonlinux:2 bash -c \
     "yum install -y python3-pip && pip3 install pyarrow -t /output/python/"
 """
 
-import base64
 import json
 import os
 from datetime import datetime, timezone
@@ -52,13 +51,12 @@ SCHEMA = pa.schema(
 s3_client = boto3.client("s3")
 
 
-def _decode_kinesis_record(record: dict) -> dict | None:
-    """Decode a single Kinesis record from base64 JSON."""
+def _decode_sqs_record(record: dict) -> dict | None:
+    """Parse a single SQS record from its message body (plain JSON string)."""
     try:
-        raw = base64.b64decode(record["kinesis"]["data"]).decode("utf-8")
-        return json.loads(raw)
+        return json.loads(record["body"])
     except Exception as e:
-        print(f"Failed to decode record: {e} — seq={record.get('kinesis', {}).get('sequenceNumber')}")
+        print(f"Failed to parse SQS record body: {e} — messageId={record.get('messageId')}")
         return None
 
 
@@ -100,17 +98,17 @@ def _write_parquet_to_s3(table: pa.Table, key: str) -> None:
 
 def lambda_handler(event, context):
     """
-    Main handler — invoked by Kinesis event source mapping.
-    Processes a batch of up to 100 Kinesis records per invocation.
+    Main handler — invoked by SQS event source mapping.
+    Processes a batch of up to 10 SQS messages per invocation.
     """
-    kinesis_records = event.get("Records", [])
-    print(f"Received {len(kinesis_records)} Kinesis records")
+    sqs_records = event.get("Records", [])
+    print(f"Received {len(sqs_records)} SQS records")
 
     payloads = []
     decode_failures = 0
 
-    for record in kinesis_records:
-        payload = _decode_kinesis_record(record)
+    for record in sqs_records:
+        payload = _decode_sqs_record(record)
         if payload is not None:
             payloads.append(payload)
         else:
@@ -130,7 +128,8 @@ def lambda_handler(event, context):
             f"(decode_failures={decode_failures})"
         )
     except Exception as e:
-        # Raise so Lambda retries the batch and eventually routes to DLQ
+        # Raise so Lambda retries the batch; after maxReceiveCount the queue
+        # routes failed messages to the DLQ via its redrive policy.
         print(f"Fatal error writing Parquet to S3: {e}")
         raise
 
@@ -138,7 +137,7 @@ def lambda_handler(event, context):
         "statusCode": 200,
         "body": json.dumps(
             {
-                "received": len(kinesis_records),
+                "received": len(sqs_records),
                 "written": table.num_rows,
                 "decode_failures": decode_failures,
                 "s3_key": key,

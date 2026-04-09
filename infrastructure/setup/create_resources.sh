@@ -35,7 +35,7 @@ ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 PROJECT_TAG="project-name=StockPulse"
 S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
 S3_SCRIPTS_BUCKET="${S3_SCRIPTS_BUCKET:-stockpulse-scripts-us}"
-KINESIS_STREAM="${KINESIS_STREAM:-stockpulse-stream}"
+SQS_QUEUE_NAME="${SQS_QUEUE_NAME:-stockpulse-queue}"
 DLQ_NAME="${DLQ_NAME:-stockpulse-dlq}"
 SNS_TOPIC_NAME="${SNS_TOPIC_NAME:-stockpulse-alerts}"
 GLUE_DB="${GLUE_DB:-stockpulse_db}"
@@ -170,23 +170,23 @@ aws iam attach-role-policy --role-name stockpulse-processor-role \
 aws iam attach-role-policy --role-name stockpulse-glue-role      \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
 
-# Inline policy: Ingester → Kinesis PutRecords
+# Inline policy: Ingester → SQS SendMessage
 aws iam put-role-policy \
   --role-name stockpulse-ingester-role \
-  --policy-name KinesisWritePolicy \
+  --policy-name SQSWritePolicy \
   --policy-document "{
     \"Version\": \"2012-10-17\",
     \"Statement\": [{
       \"Effect\": \"Allow\",
-      \"Action\": [\"kinesis:PutRecord\", \"kinesis:PutRecords\", \"kinesis:DescribeStream\"],
-      \"Resource\": \"arn:aws:kinesis:$AWS_REGION:$ACCOUNT_ID:stream/$KINESIS_STREAM\"
+      \"Action\": [\"sqs:SendMessage\", \"sqs:GetQueueUrl\"],
+      \"Resource\": \"arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:$SQS_QUEUE_NAME\"
     }]
   }"
 
-# Inline policy: Processor → S3 write + SQS DLQ
+# Inline policy: Processor → S3 write + SQS read/delete
 aws iam put-role-policy \
   --role-name stockpulse-processor-role \
-  --policy-name S3WritePolicy \
+  --policy-name S3WriteAndSQSReadPolicy \
   --policy-document "{
     \"Version\": \"2012-10-17\",
     \"Statement\": [
@@ -200,15 +200,13 @@ aws iam put-role-policy \
       },
       {
         \"Effect\": \"Allow\",
-        \"Action\": [\"kinesis:GetRecords\", \"kinesis:GetShardIterator\",
-                    \"kinesis:DescribeStream\", \"kinesis:ListShards\",
-                    \"kinesis:ListStreams\"],
-        \"Resource\": \"arn:aws:kinesis:$AWS_REGION:$ACCOUNT_ID:stream/$KINESIS_STREAM\"
-      },
-      {
-        \"Effect\": \"Allow\",
-        \"Action\": [\"sqs:SendMessage\"],
-        \"Resource\": \"arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:$DLQ_NAME\"
+        \"Action\": [
+          \"sqs:ReceiveMessage\",
+          \"sqs:DeleteMessage\",
+          \"sqs:GetQueueAttributes\",
+          \"sqs:ChangeMessageVisibility\"
+        ],
+        \"Resource\": \"arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:$SQS_QUEUE_NAME\"
       }
     ]
   }"
@@ -263,46 +261,39 @@ aws iam put-role-policy \
 echo "  IAM roles and policies configured."
 
 # ---------------------------------------------------------------------------
-# 3. Kinesis Data Stream
+# 3. SQS Main Queue (ingester → processor)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[3/9] Creating Kinesis Data Stream..."
+echo "[3/9] Creating SQS main queue..."
 
-if aws kinesis describe-stream-summary \
-    --stream-name "$KINESIS_STREAM" \
-    --region "$AWS_REGION" 2>/dev/null; then
-  echo "  Stream $KINESIS_STREAM already exists — skipping"
-else
-  aws kinesis create-stream \
-    --stream-name "$KINESIS_STREAM" \
-    --shard-count 1 \
-    --region "$AWS_REGION"
+MAIN_QUEUE_URL=$(aws sqs create-queue \
+  --queue-name "$SQS_QUEUE_NAME" \
+  --attributes '{
+    "MessageRetentionPeriod": "86400",
+    "VisibilityTimeout": "120"
+  }' \
+  --region "$AWS_REGION" \
+  --query QueueUrl \
+  --output text 2>/dev/null || \
+  aws sqs get-queue-url \
+    --queue-name "$SQS_QUEUE_NAME" \
+    --region "$AWS_REGION" \
+    --query QueueUrl \
+    --output text)
 
-  # Wait for stream to be ACTIVE
-  echo "  Waiting for stream to become ACTIVE..."
-  aws kinesis wait stream-exists --stream-name "$KINESIS_STREAM" --region "$AWS_REGION"
+MAIN_QUEUE_ARN=$(aws sqs get-queue-attributes \
+  --queue-url "$MAIN_QUEUE_URL" \
+  --attribute-names QueueArn \
+  --query Attributes.QueueArn \
+  --output text \
+  --region "$AWS_REGION")
 
-  # Enable server-side encryption
-  aws kinesis start-stream-encryption \
-    --stream-name "$KINESIS_STREAM" \
-    --encryption-type KMS \
-    --key-id alias/aws/kinesis \
-    --region "$AWS_REGION"
-
-  echo "  Kinesis stream '$KINESIS_STREAM' created (1 shard, 24h retention, SSE enabled)."
-fi
-
-# Tag the stream
-aws kinesis add-tags-to-stream \
-  --stream-name "$KINESIS_STREAM" \
+aws sqs tag-queue \
+  --queue-url "$MAIN_QUEUE_URL" \
   --tags project-name=StockPulse \
-  --region "$AWS_REGION" 2>/dev/null || true
+  --region "$AWS_REGION"
 
-# Set retention to 24 hours (default is already 24h, but be explicit)
-aws kinesis increase-stream-retention-period \
-  --stream-name "$KINESIS_STREAM" \
-  --retention-period-hours 24 \
-  --region "$AWS_REGION" 2>/dev/null || true
+echo "  SQS main queue created: $MAIN_QUEUE_ARN"
 
 # ---------------------------------------------------------------------------
 # 4. SQS Dead Letter Queue
@@ -336,6 +327,14 @@ aws sqs tag-queue \
 
 echo "  SQS DLQ created: $DLQ_ARN"
 
+# Set redrive policy on the main queue → DLQ after 3 failures
+aws sqs set-queue-attributes \
+  --queue-url "$MAIN_QUEUE_URL" \
+  --attributes "{\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" \
+  --region "$AWS_REGION"
+
+echo "  Redrive policy set: main queue → DLQ after 3 failures."
+
 # ---------------------------------------------------------------------------
 # 5. SNS Topic for CloudWatch Alarms
 # ---------------------------------------------------------------------------
@@ -362,7 +361,7 @@ echo "[6/9] Creating CloudWatch alarms..."
 # Alarm 1: Lambda Ingester errors
 aws cloudwatch put-metric-alarm \
   --alarm-name "StockPulse-Ingester-Errors" \
-  --alarm-description "Lambda ingester has errors — check Polygon.io API key or Kinesis permissions" \
+  --alarm-description "Lambda ingester has errors — check Polygon.io API key or SQS permissions" \
   --namespace AWS/Lambda \
   --metric-name Errors \
   --dimensions Name=FunctionName,Value="$LAMBDA_INGESTER_NAME" \
@@ -393,16 +392,16 @@ aws cloudwatch put-metric-alarm \
   --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
-# Alarm 3: Kinesis iterator age > 60s (consumer falling behind)
+# Alarm 3: SQS main queue depth > 50 (processor falling behind)
 aws cloudwatch put-metric-alarm \
-  --alarm-name "StockPulse-Kinesis-IteratorAge" \
-  --alarm-description "Kinesis consumer is falling behind — processor Lambda may be slow or throttled" \
-  --namespace AWS/Kinesis \
-  --metric-name GetRecords.IteratorAgeMilliseconds \
-  --dimensions Name=StreamName,Value="$KINESIS_STREAM" \
+  --alarm-name "StockPulse-SQS-QueueDepth" \
+  --alarm-description "SQS queue depth is high — processor Lambda may be slow or throttled" \
+  --namespace AWS/SQS \
+  --metric-name ApproximateNumberOfMessagesVisible \
+  --dimensions Name=QueueName,Value="$SQS_QUEUE_NAME" \
   --statistic Maximum \
   --period 60 \
-  --threshold 60000 \
+  --threshold 50 \
   --comparison-operator GreaterThanThreshold \
   --evaluation-periods 2 \
   --alarm-actions "$SNS_ARN" \
@@ -508,7 +507,7 @@ echo ""
 echo "5. Sign up for Grafana Cloud (free) and import grafana/dashboard.json"
 echo ""
 echo "   S3 Bucket:      s3://$S3_BUCKET"
-echo "   Kinesis Stream: $KINESIS_STREAM"
+echo "   SQS Queue:      $MAIN_QUEUE_ARN"
 echo "   DLQ ARN:        $DLQ_ARN"
 echo "   SNS Topic:      $SNS_ARN"
 echo "   Glue DB:        $GLUE_DB"

@@ -1,12 +1,14 @@
 """
 StockPulse — Lambda Ingester
-Fetches stock data from Polygon.io and publishes to Kinesis Data Streams.
+Fetches previous-day OHLCV data from Polygon.io (free tier) and publishes
+to SQS for processing.
 
-Uses the Snapshot endpoint to fetch all 10 symbols in a single API call,
-respecting Polygon.io free tier rate limit of 5 requests/minute.
+Uses /v2/aggs/ticker/{symbol}/prev — available on Polygon.io free tier.
+Rate limit: 5 req/min → 13s delay between calls.
+10 symbols × 13s = ~130s → Lambda timeout must be ≥ 180s.
 
 Triggered by: Amazon EventBridge (cron: every 1 min, market hours)
-Destination:  Amazon Kinesis Data Streams (stockpulse-stream)
+Destination:  Amazon SQS (stockpulse-queue)
 """
 
 import json
@@ -18,7 +20,7 @@ import urllib3
 # ---------------------------------------------------------------------------
 # Configuration (all values come from Lambda environment variables)
 # ---------------------------------------------------------------------------
-KINESIS_STREAM_NAME = os.environ.get("KINESIS_STREAM_NAME", "stockpulse-stream")
+SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
 SYMBOLS = os.environ.get(
     "SYMBOLS", "AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ"
 ).split(",")
@@ -29,7 +31,7 @@ BASE_URL = "https://api.polygon.io"
 # ---------------------------------------------------------------------------
 # AWS clients (initialised once outside handler for connection reuse)
 # ---------------------------------------------------------------------------
-kinesis_client = boto3.client("kinesis")
+sqs_client = boto3.client("sqs")
 secrets_client = boto3.client("secretsmanager")
 http = urllib3.PoolManager(timeout=urllib3.Timeout(connect=5.0, read=10.0))
 
@@ -42,81 +44,36 @@ def _get_polygon_api_key() -> str:
 
 # Fetched once per Lambda container lifetime (cached across warm invocations)
 POLYGON_API_KEY = _get_polygon_api_key()
-SNAPSHOT_URL = (
-    f"{BASE_URL}/v2/snapshot/locale/us/markets/stocks/tickers"
-    f"?tickers={','.join(SYMBOLS)}&apiKey={POLYGON_API_KEY}"
-)
 
 
-def _fetch_snapshot() -> list[dict]:
+def _fetch_all_symbols() -> list[dict]:
     """
-    Fetch a market snapshot for all tracked symbols in a single API call.
-    Falls back to per-symbol /prev endpoint if snapshot returns no data.
-    Returns a list of normalised tick records.
+    Fetch previous-day OHLCV for each symbol using /v2/aggs/ticker/{symbol}/prev.
+    Free tier supports this endpoint. Rate limit: 5 req/min → 13s between calls.
     """
     records = []
     ingestion_ts = int(time.time() * 1000)
 
-    try:
-        response = http.request("GET", SNAPSHOT_URL)
-        if response.status == 429:
-            print("Rate limited by Polygon.io — backing off 15s")
-            time.sleep(15)
-            response = http.request("GET", SNAPSHOT_URL)
-
-        data = json.loads(response.data.decode("utf-8"))
-
-        tickers = data.get("tickers") or []
-        for ticker in tickers:
-            symbol = ticker.get("ticker")
-            day = ticker.get("day") or {}
-            prev_day = ticker.get("prevDay") or {}
-
-            # Prefer current day bar; fall back to prevDay
-            bar = day if day.get("c") else prev_day
-            if not bar.get("c"):
-                print(f"No bar data for {symbol} — skipping")
-                continue
-
-            records.append(
-                {
-                    "symbol": symbol,
-                    "open": bar.get("o"),
-                    "high": bar.get("h"),
-                    "low": bar.get("l"),
-                    "close": bar.get("c"),
-                    "volume": bar.get("v"),
-                    "vwap": bar.get("vw"),
-                    "timestamp": ticker.get("lastTrade", {}).get("t")
-                    or int(time.time() * 1000),
-                    "num_trades": bar.get("n"),
-                    "ingestion_time": ingestion_ts,
-                }
-            )
-
-    except Exception as e:
-        print(f"Snapshot fetch failed: {e} — falling back to per-symbol /prev")
-        records = _fetch_prev_close(ingestion_ts)
-
-    return records
-
-
-def _fetch_prev_close(ingestion_ts: int) -> list[dict]:
-    """
-    Fallback: fetch previous close for each symbol individually.
-    Respects rate limit with a 13s delay between calls (5 req/min = 12s gap).
-    """
-    records = []
     for i, symbol in enumerate(SYMBOLS):
         if i > 0:
-            time.sleep(13)  # Stay safely under 5 req/min
+            time.sleep(13)  # Stay safely under 5 req/min (12s minimum gap)
         try:
             url = (
                 f"{BASE_URL}/v2/aggs/ticker/{symbol}/prev"
                 f"?adjusted=true&apiKey={POLYGON_API_KEY}"
             )
             response = http.request("GET", url)
+
+            if response.status == 429:
+                print(f"Rate limited on {symbol} — backing off 30s")
+                time.sleep(30)
+                response = http.request("GET", url)
+
             data = json.loads(response.data.decode("utf-8"))
+
+            if data.get("status") == "NOT_AUTHORIZED":
+                print(f"NOT_AUTHORIZED for {symbol}: {data.get('message')}")
+                continue
 
             if data.get("resultsCount", 0) > 0:
                 for result in data["results"]:
@@ -134,53 +91,45 @@ def _fetch_prev_close(ingestion_ts: int) -> list[dict]:
                             "ingestion_time": ingestion_ts,
                         }
                     )
+                print(f"  {symbol}: fetched {data['resultsCount']} record(s)")
+            else:
+                print(f"  {symbol}: no results (status={data.get('status')})")
+
         except Exception as e:
             print(f"Error fetching {symbol}: {e}")
 
     return records
 
 
-def _put_to_kinesis(records: list[dict]) -> int:
+def _send_to_sqs(records: list[dict]) -> int:
     """
-    Batch-put records to Kinesis. Returns count of failed records.
-    Kinesis put_records limit: 500 records or 5 MB per call.
+    Batch-send records to SQS. Returns count of failed records.
+    SQS send_message_batch limit: 10 messages per call.
     """
     if not records:
         return 0
 
-    kinesis_records = [
-        {
-            "Data": json.dumps(record).encode("utf-8"),
-            "PartitionKey": record["symbol"],  # Same-symbol events → same shard
-        }
-        for record in records[:500]
-    ]
-
     failed = 0
-    try:
-        response = kinesis_client.put_records(
-            StreamName=KINESIS_STREAM_NAME, Records=kinesis_records
-        )
-        failed = response.get("FailedRecordCount", 0)
-
-        # Retry failed records once with exponential backoff
-        if failed > 0:
-            print(f"{failed} records failed — retrying after 2s")
-            time.sleep(2)
-            failed_indices = [
-                i
-                for i, r in enumerate(response["Records"])
-                if r.get("ErrorCode")
-            ]
-            retry_records = [kinesis_records[i] for i in failed_indices]
-            retry_response = kinesis_client.put_records(
-                StreamName=KINESIS_STREAM_NAME, Records=retry_records
+    # SQS batch limit is 10 messages per call
+    for i in range(0, len(records), 10):
+        batch = records[i : i + 10]
+        entries = [
+            {"Id": str(j), "MessageBody": json.dumps(record)}
+            for j, record in enumerate(batch)
+        ]
+        try:
+            response = sqs_client.send_message_batch(
+                QueueUrl=SQS_QUEUE_URL,
+                Entries=entries,
             )
-            failed = retry_response.get("FailedRecordCount", 0)
-
-    except Exception as e:
-        print(f"Kinesis put_records error: {e}")
-        failed = len(kinesis_records)
+            batch_failed = len(response.get("Failed", []))
+            if batch_failed > 0:
+                for f in response["Failed"]:
+                    print(f"SQS send failed Id={f['Id']}: {f.get('Message')}")
+            failed += batch_failed
+        except Exception as e:
+            print(f"SQS send_message_batch error: {e}")
+            failed += len(batch)
 
     return failed
 
@@ -189,13 +138,13 @@ def lambda_handler(event, context):
     """Main Lambda handler — invoked by EventBridge every 1 minute."""
     print(f"StockPulse ingester started. Tracking: {SYMBOLS}")
 
-    records = _fetch_snapshot()
+    records = _fetch_all_symbols()
     print(f"Fetched {len(records)} records from Polygon.io")
 
-    failed = _put_to_kinesis(records)
+    failed = _send_to_sqs(records)
     success = len(records) - failed
 
-    print(f"Kinesis result: {success} succeeded, {failed} failed")
+    print(f"SQS result: {success} succeeded, {failed} failed")
 
     return {
         "statusCode": 200,

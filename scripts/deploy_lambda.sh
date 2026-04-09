@@ -4,7 +4,7 @@
 # Packages and deploys both Lambda functions (ingester + processor).
 #
 # Usage:
-#   POLYGON_API_KEY=your_key_here ./scripts/deploy_lambda.sh
+#   ./scripts/deploy_lambda.sh
 #
 # Prerequisites:
 #   - AWS CLI configured
@@ -23,7 +23,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 POLYGON_SECRET_NAME="${POLYGON_SECRET_NAME:-stockpulse/polygon-api-key}"
-KINESIS_STREAM="${KINESIS_STREAM:-stockpulse-stream}"
+SQS_QUEUE_NAME="${SQS_QUEUE_NAME:-stockpulse-queue}"
 S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
 SYMBOLS="${SYMBOLS:-AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ}"
 
@@ -33,9 +33,19 @@ BUILD_DIR="$PROJECT_ROOT/.build"
 
 mkdir -p "$BUILD_DIR"
 
+# Resolve SQS queue URL
+SQS_QUEUE_URL=$(aws sqs get-queue-url \
+  --queue-name "$SQS_QUEUE_NAME" \
+  --region "$AWS_REGION" \
+  --query QueueUrl \
+  --output text)
+
+SQS_QUEUE_ARN="arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:$SQS_QUEUE_NAME"
+
 echo "============================================================"
 echo "StockPulse — Lambda Deployment"
 echo "Region:  $AWS_REGION | Account: $ACCOUNT_ID"
+echo "SQS Queue: $SQS_QUEUE_URL"
 echo "============================================================"
 
 # ---------------------------------------------------------------------------
@@ -55,21 +65,29 @@ else
   mkdir -p "$LAYER_DIR"
 
   docker run --rm \
+    --platform linux/amd64 \
     --entrypoint bash \
     -v "$LAYER_DIR:/output" \
     public.ecr.aws/lambda/python:3.11 \
     -c "pip install --upgrade pip && \
-        pip install --only-binary=:all: 'pyarrow==14.0.2' -t /output/python/ && \
+        pip install --only-binary=:all: 'pyarrow==14.0.2' 'numpy<2' -t /output/python/ && \
         echo 'PyArrow installed successfully'"
 
   (cd "$LAYER_DIR" && zip -r "$LAYER_ZIP" python/)
   echo "  Layer zip created: $LAYER_ZIP"
 fi
 
+# Layer zip exceeds Lambda's 69MB direct upload limit — upload via S3
+S3_SCRIPTS_BUCKET="${S3_SCRIPTS_BUCKET:-stockpulse-scripts-us}"
+LAYER_S3_KEY="layers/pyarrow-layer.zip"
+
+echo "  Uploading layer zip to s3://$S3_SCRIPTS_BUCKET/$LAYER_S3_KEY ..."
+aws s3 cp "$LAYER_ZIP" "s3://$S3_SCRIPTS_BUCKET/$LAYER_S3_KEY" --region "$AWS_REGION"
+
 LAYER_ARN=$(aws lambda publish-layer-version \
   --layer-name "stockpulse-pyarrow" \
   --description "PyArrow for StockPulse processor (Amazon Linux 2, Python 3.11)" \
-  --zip-file "fileb://$LAYER_ZIP" \
+  --content "S3Bucket=$S3_SCRIPTS_BUCKET,S3Key=$LAYER_S3_KEY" \
   --compatible-runtimes python3.11 \
   --compatible-architectures x86_64 \
   --region "$AWS_REGION" \
@@ -92,7 +110,7 @@ echo "  Packaged: $INGESTER_ZIP"
 
 if aws lambda get-function \
     --function-name "stockpulse-ingester" \
-    --region "$AWS_REGION" 2>/dev/null; then
+    --region "$AWS_REGION" > /dev/null 2>&1; then
   echo "  Updating existing ingester Lambda..."
   aws lambda update-function-code \
     --function-name "stockpulse-ingester" \
@@ -105,7 +123,8 @@ if aws lambda get-function \
 
   aws lambda update-function-configuration \
     --function-name "stockpulse-ingester" \
-    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
+    --timeout 180 \
+    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"SQS_QUEUE_URL\":\"$SQS_QUEUE_URL\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
     --region "$AWS_REGION"
 
   aws lambda tag-resource \
@@ -120,10 +139,10 @@ else
     --role "$INGESTER_ROLE" \
     --handler lambda_function.lambda_handler \
     --zip-file "fileb://$INGESTER_ZIP" \
-    --timeout 60 \
+    --timeout 180 \
     --memory-size 256 \
-    --description "StockPulse: fetches Polygon.io data and publishes to Kinesis" \
-    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
+    --description "StockPulse: fetches Polygon.io data and publishes to SQS" \
+    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"SQS_QUEUE_URL\":\"$SQS_QUEUE_URL\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
     --tags "project-name=StockPulse" \
     --region "$AWS_REGION"
 fi
@@ -180,11 +199,9 @@ PROCESSOR_ZIP="$BUILD_DIR/processor.zip"
 (cd "$PROCESSOR_DIR" && zip -r "$PROCESSOR_ZIP" lambda_function.py)
 echo "  Packaged: $PROCESSOR_ZIP"
 
-DLQ_ARN="arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:stockpulse-dlq"
-
 if aws lambda get-function \
     --function-name "stockpulse-processor" \
-    --region "$AWS_REGION" 2>/dev/null; then
+    --region "$AWS_REGION" > /dev/null 2>&1; then
   echo "  Updating existing processor Lambda..."
   aws lambda update-function-code \
     --function-name "stockpulse-processor" \
@@ -215,7 +232,7 @@ else
     --zip-file "fileb://$PROCESSOR_ZIP" \
     --timeout 120 \
     --memory-size 512 \
-    --description "StockPulse: consumes Kinesis, writes Parquet to S3" \
+    --description "StockPulse: consumes SQS queue, writes Parquet to S3" \
     --layers "$LAYER_ARN" \
     --environment "{\"Variables\":{\"S3_BUCKET\":\"$S3_BUCKET\"}}" \
     --tags "project-name=StockPulse" \
@@ -223,17 +240,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: Create Kinesis Event Source Mapping for Processor
+# Step 4: Create SQS Event Source Mapping for Processor
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/4] Configuring Kinesis event source mapping..."
-
-KINESIS_ARN="arn:aws:kinesis:$AWS_REGION:$ACCOUNT_ID:stream/$KINESIS_STREAM"
+echo "[4/4] Configuring SQS event source mapping..."
 
 # Check if mapping already exists
 EXISTING_MAPPING=$(aws lambda list-event-source-mappings \
   --function-name "stockpulse-processor" \
-  --event-source-arn "$KINESIS_ARN" \
+  --event-source-arn "$SQS_QUEUE_ARN" \
   --region "$AWS_REGION" \
   --query "EventSourceMappings[0].UUID" \
   --output text 2>/dev/null || echo "None")
@@ -241,15 +256,12 @@ EXISTING_MAPPING=$(aws lambda list-event-source-mappings \
 if [ "$EXISTING_MAPPING" = "None" ] || [ -z "$EXISTING_MAPPING" ]; then
   aws lambda create-event-source-mapping \
     --function-name "stockpulse-processor" \
-    --event-source-arn "$KINESIS_ARN" \
-    --batch-size 100 \
-    --starting-position LATEST \
-    --destination-config "OnFailure={Destination=$DLQ_ARN}" \
-    --bisect-batch-on-function-error \
+    --event-source-arn "$SQS_QUEUE_ARN" \
+    --batch-size 10 \
     --region "$AWS_REGION"
-  echo "  Kinesis event source mapping created."
+  echo "  SQS event source mapping created."
 else
-  echo "  Kinesis event source mapping already exists (UUID: $EXISTING_MAPPING) — skipping."
+  echo "  SQS event source mapping already exists (UUID: $EXISTING_MAPPING) — skipping."
 fi
 
 echo ""
