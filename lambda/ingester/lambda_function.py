@@ -1,14 +1,14 @@
 """
 StockPulse — Lambda Ingester
 Fetches previous-day OHLCV data from Polygon.io (free tier) and publishes
-to SQS for processing.
+to Kinesis Data Stream for processing.
 
 Uses /v2/aggs/ticker/{symbol}/prev — available on Polygon.io free tier.
 Rate limit: 5 req/min → 13s delay between calls.
 10 symbols × 13s = ~130s → Lambda timeout must be ≥ 180s.
 
-Triggered by: Amazon EventBridge (cron: every 1 min, market hours)
-Destination:  Amazon SQS (stockpulse-queue)
+Triggered by: Amazon EventBridge (cron: every 5 min, market hours)
+Destination:  Amazon Kinesis Data Stream (stockpulse-stream)
 """
 
 import json
@@ -20,7 +20,7 @@ import urllib3
 # ---------------------------------------------------------------------------
 # Configuration (all values come from Lambda environment variables)
 # ---------------------------------------------------------------------------
-SQS_QUEUE_URL = os.environ.get("SQS_QUEUE_URL", "")
+KINESIS_STREAM_NAME = os.environ.get("KINESIS_STREAM_NAME", "stockpulse-stream")
 SYMBOLS = os.environ.get(
     "SYMBOLS", "AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ"
 ).split(",")
@@ -31,7 +31,7 @@ BASE_URL = "https://api.polygon.io"
 # ---------------------------------------------------------------------------
 # AWS clients (initialised once outside handler for connection reuse)
 # ---------------------------------------------------------------------------
-sqs_client = boto3.client("sqs")
+kinesis_client = boto3.client("kinesis")
 secrets_client = boto3.client("secretsmanager")
 http = urllib3.PoolManager(timeout=urllib3.Timeout(connect=5.0, read=10.0))
 
@@ -101,50 +101,55 @@ def _fetch_all_symbols() -> list[dict]:
     return records
 
 
-def _send_to_sqs(records: list[dict]) -> int:
+def _send_to_kinesis(records: list[dict]) -> int:
     """
-    Batch-send records to SQS. Returns count of failed records.
-    SQS send_message_batch limit: 10 messages per call.
+    Batch-send records to Kinesis. Returns count of failed records.
+    Kinesis put_records limit: 500 records or 5MB per call.
+    Each record is partitioned by symbol for ordered processing per ticker.
     """
     if not records:
         return 0
 
     failed = 0
-    # SQS batch limit is 10 messages per call
-    for i in range(0, len(records), 10):
-        batch = records[i : i + 10]
-        entries = [
-            {"Id": str(j), "MessageBody": json.dumps(record)}
-            for j, record in enumerate(batch)
+    # Kinesis allows up to 500 records per put_records call
+    for i in range(0, len(records), 500):
+        batch = records[i : i + 500]
+        kinesis_records = [
+            {
+                "Data": json.dumps(record).encode("utf-8"),
+                "PartitionKey": record["symbol"],
+            }
+            for record in batch
         ]
         try:
-            response = sqs_client.send_message_batch(
-                QueueUrl=SQS_QUEUE_URL,
-                Entries=entries,
+            response = kinesis_client.put_records(
+                StreamName=KINESIS_STREAM_NAME,
+                Records=kinesis_records,
             )
-            batch_failed = len(response.get("Failed", []))
+            batch_failed = response.get("FailedRecordCount", 0)
             if batch_failed > 0:
-                for f in response["Failed"]:
-                    print(f"SQS send failed Id={f['Id']}: {f.get('Message')}")
+                for j, rec in enumerate(response["Records"]):
+                    if "ErrorCode" in rec:
+                        print(f"Kinesis put failed record {j}: {rec.get('ErrorMessage')}")
             failed += batch_failed
         except Exception as e:
-            print(f"SQS send_message_batch error: {e}")
+            print(f"Kinesis put_records error: {e}")
             failed += len(batch)
 
     return failed
 
 
 def lambda_handler(event, context):
-    """Main Lambda handler — invoked by EventBridge every 1 minute."""
+    """Main Lambda handler — invoked by EventBridge every 5 minutes."""
     print(f"StockPulse ingester started. Tracking: {SYMBOLS}")
 
     records = _fetch_all_symbols()
     print(f"Fetched {len(records)} records from Polygon.io")
 
-    failed = _send_to_sqs(records)
+    failed = _send_to_kinesis(records)
     success = len(records) - failed
 
-    print(f"SQS result: {success} succeeded, {failed} failed")
+    print(f"Kinesis result: {success} succeeded, {failed} failed")
 
     return {
         "statusCode": 200,

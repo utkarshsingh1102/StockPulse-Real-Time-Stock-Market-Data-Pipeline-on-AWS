@@ -4,15 +4,15 @@
 -- Prerequisites:
 --   1. Run redshift_ddl.sql first to create the table
 --   2. Replace <ACCOUNT_ID> and <REGION> with your actual values
---   3. Ensure the stockpulse-redshift-role has s3:GetObject on stockpulse-data-us
+--   3. Ensure the stockpulse-redshift-role has s3:GetObject on stockpulse-data-us2
 
 -- Full load (initial setup or after clearing the table)
 COPY public.ohlcv (
     symbol,
-    open,
+    "open",
     high,
     low,
-    close,
+    "close",
     volume,
     vwap,
     timestamp_ms,
@@ -26,7 +26,7 @@ COPY public.ohlcv (
     avg_volume_10bar,
     ingestion_time
 )
-FROM 's3://stockpulse-data-us/processed/'
+FROM 's3://stockpulse-data-us2/processed/'
 IAM_ROLE 'arn:aws:iam::<ACCOUNT_ID>:role/stockpulse-redshift-role'
 FORMAT AS PARQUET
 SERIALIZETOJSON;
@@ -37,7 +37,7 @@ SERIALIZETOJSON;
 -- Replace YYYY-MM-DD with today's date or parameterise via a stored procedure
 -- ---------------------------------------------------------------------------
 -- COPY public.ohlcv
--- FROM 's3://stockpulse-data-us/processed/trade_date=YYYY-MM-DD/'
+-- FROM 's3://stockpulse-data-us2/processed/trade_date=YYYY-MM-DD/'
 -- IAM_ROLE 'arn:aws:iam::<ACCOUNT_ID>:role/stockpulse-redshift-role'
 -- FORMAT AS PARQUET
 -- SERIALIZETOJSON;

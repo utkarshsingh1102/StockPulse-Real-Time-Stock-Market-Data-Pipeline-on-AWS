@@ -29,8 +29,8 @@ AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 # ---------------------------------------------------------------------------
 # S3
 # ---------------------------------------------------------------------------
-S3_BUCKET = os.environ.get("S3_BUCKET", "stockpulse-data-us")
-S3_SCRIPTS_BUCKET = os.environ.get("S3_SCRIPTS_BUCKET", "stockpulse-scripts-us")
+S3_BUCKET = os.environ.get("S3_BUCKET", "stockpulse-data-us2")
+S3_SCRIPTS_BUCKET = os.environ.get("S3_SCRIPTS_BUCKET", "stockpulse-scripts-us2")
 
 # ---------------------------------------------------------------------------
 # Kinesis

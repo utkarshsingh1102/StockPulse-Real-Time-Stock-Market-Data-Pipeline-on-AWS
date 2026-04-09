@@ -9,8 +9,8 @@ Workers:     2
 
 Job parameters (passed via --job-bookmark-option and --args):
   --JOB_NAME        stockpulse-ohlcv-transform
-  --S3_INPUT_PATH   s3://stockpulse-data-us/raw/
-  --S3_OUTPUT_PATH  s3://stockpulse-data-us/processed/
+  --S3_INPUT_PATH   s3://stockpulse-data-us2/raw/
+  --S3_OUTPUT_PATH  s3://stockpulse-data-us2/processed/
 
 Run via AWS console, Glue trigger, or:
   aws glue start-job-run --job-name stockpulse-ohlcv-transform
@@ -39,8 +39,8 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args["JOB_NAME"], args)
 
-S3_INPUT_PATH = args["S3_INPUT_PATH"]   # e.g. s3://stockpulse-data-us/raw/
-S3_OUTPUT_PATH = args["S3_OUTPUT_PATH"] # e.g. s3://stockpulse-data-us/processed/
+S3_INPUT_PATH = args["S3_INPUT_PATH"]   # e.g. s3://stockpulse-data-us2/raw/
+S3_OUTPUT_PATH = args["S3_OUTPUT_PATH"] # e.g. s3://stockpulse-data-us2/processed/
 
 print(f"Reading raw data from: {S3_INPUT_PATH}")
 print(f"Writing processed data to: {S3_OUTPUT_PATH}")
@@ -68,7 +68,7 @@ clean_df = (
     # VWAP: fall back to close price if missing
     .withColumn("vwap", F.coalesce(F.col("vwap"), F.col("close")))
     # num_trades: default to 0 if missing
-    .withColumn("num_trades", F.coalesce(F.col("num_trades").cast("long"), F.lit(0L)))
+    .withColumn("num_trades", F.coalesce(F.col("num_trades").cast("long"), F.lit(0)))
     # volume: cast to long (stored as float64 in raw to handle None)
     .withColumn("volume", F.col("volume").cast("long"))
     # Drop rows with no symbol or no timestamp — cannot be keyed
@@ -145,18 +145,42 @@ final_count = clean_df.count()
 print(f"Final record count after cleaning: {final_count}")
 
 # ---------------------------------------------------------------------------
-# 7. Write processed Parquet to S3 with Hive partitioning
-#    Partitioned by trade_date then symbol for efficient date-range queries
+# 7. Select and cast all columns to exactly match Redshift ohlcv table schema.
+#    Parquet DOUBLE != Redshift DECIMAL — explicit casts are required.
+# ---------------------------------------------------------------------------
+output_df = clean_df.select(
+    F.col("symbol"),
+    F.col("open").cast("decimal(12,4)"),
+    F.col("high").cast("decimal(12,4)"),
+    F.col("low").cast("decimal(12,4)"),
+    F.col("close").cast("decimal(12,4)"),
+    F.col("volume").cast("long"),
+    F.col("vwap").cast("decimal(12,4)"),
+    F.col("timestamp").cast("long").alias("timestamp_ms"),
+    F.col("num_trades").cast("long"),
+    F.col("event_time"),
+    F.col("trade_date"),
+    F.col("price_change").cast("decimal(12,4)"),
+    F.col("price_change_pct").cast("decimal(8,4)"),
+    F.col("bar_range_pct").cast("decimal(8,4)"),
+    F.col("is_market_hours"),
+    F.col("avg_volume_10bar").cast("decimal(18,2)"),
+    F.col("ingestion_time").cast("long"),
+)
+
+# ---------------------------------------------------------------------------
+# 8. Write processed Parquet to S3
+#    No Hive partitioning — all columns must be inside the file for
+#    Redshift COPY to load them correctly.
 # ---------------------------------------------------------------------------
 (
-    clean_df
+    output_df
     .write
     .mode("append")
-    .partitionBy("trade_date", "symbol")
     .parquet(S3_OUTPUT_PATH)
 )
 
-print(f"Wrote {final_count} records to {S3_OUTPUT_PATH}")
+print(f"Wrote {output_df.count()} records to {S3_OUTPUT_PATH}")
 
 # ---------------------------------------------------------------------------
 # Commit job bookmark — ensures Glue doesn't reprocess already-seen files

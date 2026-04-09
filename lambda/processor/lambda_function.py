@@ -1,17 +1,19 @@
 """
-StockPulse — Lambda Processor
-Consumes records from SQS, converts them to Parquet,
-and writes to S3 raw zone with Hive-style partitioning.
+StockPulse — Lambda Processor (Bronze Layer)
+Consumes records from Kinesis Data Stream, converts to Parquet,
+and writes raw data to S3 bronze zone (no enrichment).
 
-Trigger:     Amazon SQS (stockpulse-queue, batch size: 10)
-Destination: Amazon S3 s3://stockpulse-data-us/raw/year=YYYY/month=MM/day=DD/
-Failure:     SQS Dead Letter Queue (stockpulse-dlq) via queue redrive policy
+Trigger:     Amazon Kinesis Data Stream (stockpulse-stream, batch size: 100)
+Destination: Amazon S3 s3://stockpulse-data-us2/raw/year=YYYY/month=MM/day=DD/
+Next layer:  Glue job (stockpulse-ohlcv-transform) reads raw/ → writes processed/
 
-Lambda Layer required: PyArrow (built for Amazon Linux 2)
-  docker run -v $(pwd):/output amazonlinux:2 bash -c \
-    "yum install -y python3-pip && pip3 install pyarrow -t /output/python/"
+Lambda Layer required: PyArrow (built for Amazon Linux 2, x86_64)
+  docker run --platform linux/amd64 -v $(pwd):/output \
+    public.ecr.aws/lambda/python:3.11 bash -c \
+    "pip install 'pyarrow==14.0.2' 'numpy<2' -t /output/python/"
 """
 
+import base64
 import json
 import os
 from datetime import datetime, timezone
@@ -28,19 +30,19 @@ S3_BUCKET = os.environ.get("S3_BUCKET", "stockpulse-data")
 S3_PREFIX = "raw"
 
 # ---------------------------------------------------------------------------
-# PyArrow schema — must match ingester record structure exactly
+# PyArrow schema — raw fields exactly as sent by ingester
 # ---------------------------------------------------------------------------
 SCHEMA = pa.schema(
     [
-        ("symbol", pa.string()),
-        ("open", pa.float64()),
-        ("high", pa.float64()),
-        ("low", pa.float64()),
-        ("close", pa.float64()),
-        ("volume", pa.float64()),   # float64 to handle None gracefully
-        ("vwap", pa.float64()),
-        ("timestamp", pa.int64()),
-        ("num_trades", pa.float64()),  # float64 to handle None gracefully
+        ("symbol",         pa.string()),
+        ("open",           pa.float64()),
+        ("high",           pa.float64()),
+        ("low",            pa.float64()),
+        ("close",          pa.float64()),
+        ("volume",         pa.float64()),
+        ("vwap",           pa.float64()),
+        ("timestamp",      pa.int64()),    # epoch ms from Polygon.io
+        ("num_trades",     pa.float64()),
         ("ingestion_time", pa.int64()),
     ]
 )
@@ -51,12 +53,17 @@ SCHEMA = pa.schema(
 s3_client = boto3.client("s3")
 
 
-def _decode_sqs_record(record: dict) -> dict | None:
-    """Parse a single SQS record from its message body (plain JSON string)."""
+def _decode_kinesis_record(record: dict) -> dict | None:
+    """
+    Decode a single Kinesis record.
+    Kinesis delivers data as base64-encoded bytes inside record["kinesis"]["data"].
+    """
     try:
-        return json.loads(record["body"])
+        raw = base64.b64decode(record["kinesis"]["data"])
+        return json.loads(raw)
     except Exception as e:
-        print(f"Failed to parse SQS record body: {e} — messageId={record.get('messageId')}")
+        seq = record.get("kinesis", {}).get("sequenceNumber", "unknown")
+        print(f"Failed to decode Kinesis record sequenceNumber={seq}: {e}")
         return None
 
 
@@ -71,7 +78,7 @@ def _build_arrow_table(payloads: list[dict]) -> pa.Table:
 
 def _s3_key(now: datetime, request_id: str) -> str:
     """
-    Build an S3 key with Hive-style partitioning for Athena compatibility.
+    Build an S3 key with Hive-style partitioning.
     Pattern: raw/year=YYYY/month=MM/day=DD/batch_HHMMSS_<request_id>.parquet
     """
     return (
@@ -98,17 +105,17 @@ def _write_parquet_to_s3(table: pa.Table, key: str) -> None:
 
 def lambda_handler(event, context):
     """
-    Main handler — invoked by SQS event source mapping.
-    Processes a batch of up to 10 SQS messages per invocation.
+    Main handler — invoked by Kinesis event source mapping.
+    Processes a batch of up to 100 Kinesis records per invocation.
     """
-    sqs_records = event.get("Records", [])
-    print(f"Received {len(sqs_records)} SQS records")
+    kinesis_records = event.get("Records", [])
+    print(f"Received {len(kinesis_records)} Kinesis records")
 
     payloads = []
     decode_failures = 0
 
-    for record in sqs_records:
-        payload = _decode_sqs_record(record)
+    for record in kinesis_records:
+        payload = _decode_kinesis_record(record)
         if payload is not None:
             payloads.append(payload)
         else:
@@ -128,8 +135,6 @@ def lambda_handler(event, context):
             f"(decode_failures={decode_failures})"
         )
     except Exception as e:
-        # Raise so Lambda retries the batch; after maxReceiveCount the queue
-        # routes failed messages to the DLQ via its redrive policy.
         print(f"Fatal error writing Parquet to S3: {e}")
         raise
 
@@ -137,7 +142,7 @@ def lambda_handler(event, context):
         "statusCode": 200,
         "body": json.dumps(
             {
-                "received": len(sqs_records),
+                "received": len(kinesis_records),
                 "written": table.num_rows,
                 "decode_failures": decode_failures,
                 "s3_key": key,

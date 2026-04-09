@@ -5,12 +5,16 @@
 --               optimising JOIN and GROUP BY on symbol.
 -- Sort key:     (trade_date, event_time) for efficient date-range scans.
 
-CREATE TABLE IF NOT EXISTS public.ohlcv (
+-- Step 1: Drop existing table
+DROP TABLE IF EXISTS public.ohlcv;
+
+-- Step 2: Recreate with schema that exactly matches Parquet output from Glue
+CREATE TABLE public.ohlcv (
     symbol              VARCHAR(10)     NOT NULL,
-    open                DECIMAL(12, 4)  NOT NULL,
+    "open"              DECIMAL(12, 4)  NOT NULL,
     high                DECIMAL(12, 4)  NOT NULL,
     low                 DECIMAL(12, 4)  NOT NULL,
-    close               DECIMAL(12, 4)  NOT NULL,
+    "close"             DECIMAL(12, 4)  NOT NULL,
     volume              BIGINT          NOT NULL DEFAULT 0,
     vwap                DECIMAL(12, 4),
     timestamp_ms        BIGINT          NOT NULL,

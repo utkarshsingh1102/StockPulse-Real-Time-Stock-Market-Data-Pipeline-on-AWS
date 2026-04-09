@@ -23,7 +23,7 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 POLYGON_SECRET_NAME="${POLYGON_SECRET_NAME:-stockpulse/polygon-api-key}"
-SQS_QUEUE_NAME="${SQS_QUEUE_NAME:-stockpulse-queue}"
+KINESIS_STREAM="${KINESIS_STREAM:-stockpulse-stream}"
 S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
 SYMBOLS="${SYMBOLS:-AAPL,MSFT,GOOGL,AMZN,TSLA,META,NVDA,JPM,V,JNJ}"
 
@@ -33,19 +33,12 @@ BUILD_DIR="$PROJECT_ROOT/.build"
 
 mkdir -p "$BUILD_DIR"
 
-# Resolve SQS queue URL
-SQS_QUEUE_URL=$(aws sqs get-queue-url \
-  --queue-name "$SQS_QUEUE_NAME" \
-  --region "$AWS_REGION" \
-  --query QueueUrl \
-  --output text)
-
-SQS_QUEUE_ARN="arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:$SQS_QUEUE_NAME"
+KINESIS_STREAM_ARN="arn:aws:kinesis:$AWS_REGION:$ACCOUNT_ID:stream/$KINESIS_STREAM"
 
 echo "============================================================"
 echo "StockPulse — Lambda Deployment"
 echo "Region:  $AWS_REGION | Account: $ACCOUNT_ID"
-echo "SQS Queue: $SQS_QUEUE_URL"
+echo "Kinesis: $KINESIS_STREAM"
 echo "============================================================"
 
 # ---------------------------------------------------------------------------
@@ -124,7 +117,7 @@ if aws lambda get-function \
   aws lambda update-function-configuration \
     --function-name "stockpulse-ingester" \
     --timeout 180 \
-    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"SQS_QUEUE_URL\":\"$SQS_QUEUE_URL\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
+    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
     --region "$AWS_REGION"
 
   aws lambda tag-resource \
@@ -141,8 +134,8 @@ else
     --zip-file "fileb://$INGESTER_ZIP" \
     --timeout 180 \
     --memory-size 256 \
-    --description "StockPulse: fetches Polygon.io data and publishes to SQS" \
-    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"SQS_QUEUE_URL\":\"$SQS_QUEUE_URL\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
+    --description "StockPulse: fetches Polygon.io data and publishes to Kinesis" \
+    --environment "{\"Variables\":{\"POLYGON_SECRET_NAME\":\"$POLYGON_SECRET_NAME\",\"KINESIS_STREAM_NAME\":\"$KINESIS_STREAM\",\"SYMBOLS\":\"$SYMBOLS\"}}" \
     --tags "project-name=StockPulse" \
     --region "$AWS_REGION"
 fi
@@ -232,7 +225,7 @@ else
     --zip-file "fileb://$PROCESSOR_ZIP" \
     --timeout 120 \
     --memory-size 512 \
-    --description "StockPulse: consumes SQS queue, writes Parquet to S3" \
+    --description "StockPulse: consumes Kinesis stream, writes Parquet to S3" \
     --layers "$LAYER_ARN" \
     --environment "{\"Variables\":{\"S3_BUCKET\":\"$S3_BUCKET\"}}" \
     --tags "project-name=StockPulse" \
@@ -240,15 +233,15 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Step 4: Create SQS Event Source Mapping for Processor
+# Step 4: Create Kinesis Event Source Mapping for Processor
 # ---------------------------------------------------------------------------
 echo ""
-echo "[4/4] Configuring SQS event source mapping..."
+echo "[4/4] Configuring Kinesis event source mapping..."
 
 # Check if mapping already exists
 EXISTING_MAPPING=$(aws lambda list-event-source-mappings \
   --function-name "stockpulse-processor" \
-  --event-source-arn "$SQS_QUEUE_ARN" \
+  --event-source-arn "$KINESIS_STREAM_ARN" \
   --region "$AWS_REGION" \
   --query "EventSourceMappings[0].UUID" \
   --output text 2>/dev/null || echo "None")
@@ -256,12 +249,13 @@ EXISTING_MAPPING=$(aws lambda list-event-source-mappings \
 if [ "$EXISTING_MAPPING" = "None" ] || [ -z "$EXISTING_MAPPING" ]; then
   aws lambda create-event-source-mapping \
     --function-name "stockpulse-processor" \
-    --event-source-arn "$SQS_QUEUE_ARN" \
-    --batch-size 10 \
+    --event-source-arn "$KINESIS_STREAM_ARN" \
+    --batch-size 100 \
+    --starting-position LATEST \
     --region "$AWS_REGION"
-  echo "  SQS event source mapping created."
+  echo "  Kinesis event source mapping created."
 else
-  echo "  SQS event source mapping already exists (UUID: $EXISTING_MAPPING) — skipping."
+  echo "  Kinesis event source mapping already exists (UUID: $EXISTING_MAPPING) — skipping."
 fi
 
 echo ""
@@ -269,5 +263,5 @@ echo "============================================================"
 echo "Lambda deployment complete!"
 echo ""
 echo "Enable ingester: aws events enable-rule --name stockpulse-ingester-schedule --region $AWS_REGION"
-echo "Test ingester:   aws lambda invoke --function-name stockpulse-ingester /tmp/ingester-out.json --region $AWS_REGION && cat /tmp/ingester-out.json"
+echo "Test ingester:   aws lambda invoke --function-name stockpulse-ingester /tmp/ingester-out.json --region $AWS_REGION --cli-read-timeout 0 && cat /tmp/ingester-out.json"
 echo "============================================================"

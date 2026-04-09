@@ -13,7 +13,7 @@
 #   chmod +x create_resources.sh && ./create_resources.sh
 #
 # Resources created:
-#   S3 bucket, IAM roles/policies, Kinesis stream, SQS DLQ,
+#   S3 buckets, IAM roles/policies, Kinesis Data Stream, SQS DLQ,
 #   SNS topic, CloudWatch alarms, Glue database, EventBridge rule
 # =============================================================================
 
@@ -21,21 +21,20 @@ set -euo pipefail
 
 # ---------------------------------------------------------------------------
 # Load .env (gitignored) so secrets and config are never hardcoded here.
-# All variables below fall back to sensible defaults if .env is absent.
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 [ -f "$PROJECT_ROOT/.env" ] && set -a && source "$PROJECT_ROOT/.env" && set +a
 
 # ---------------------------------------------------------------------------
-# Configuration (values come from .env; defaults shown as fallbacks)
+# Configuration
 # ---------------------------------------------------------------------------
 AWS_REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 PROJECT_TAG="project-name=StockPulse"
 S3_BUCKET="${S3_BUCKET:-stockpulse-data-us}"
 S3_SCRIPTS_BUCKET="${S3_SCRIPTS_BUCKET:-stockpulse-scripts-us}"
-SQS_QUEUE_NAME="${SQS_QUEUE_NAME:-stockpulse-queue}"
+KINESIS_STREAM="${KINESIS_STREAM:-stockpulse-stream}"
 DLQ_NAME="${DLQ_NAME:-stockpulse-dlq}"
 SNS_TOPIC_NAME="${SNS_TOPIC_NAME:-stockpulse-alerts}"
 GLUE_DB="${GLUE_DB:-stockpulse_db}"
@@ -144,7 +143,7 @@ EVENTBRIDGE_TRUST='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Princ
 create_role_if_not_exists() {
   local role_name="$1"
   local trust_doc="$2"
-  if aws iam get-role --role-name "$role_name" 2>/dev/null; then
+  if aws iam get-role --role-name "$role_name" > /dev/null 2>&1; then
     echo "  Role $role_name already exists — skipping"
   else
     aws iam create-role \
@@ -156,10 +155,10 @@ create_role_if_not_exists() {
   fi
 }
 
-create_role_if_not_exists "stockpulse-ingester-role"   "$LAMBDA_TRUST"
-create_role_if_not_exists "stockpulse-processor-role"  "$LAMBDA_TRUST"
-create_role_if_not_exists "stockpulse-glue-role"       "$GLUE_TRUST"
-create_role_if_not_exists "stockpulse-redshift-role"   "$REDSHIFT_TRUST"
+create_role_if_not_exists "stockpulse-ingester-role"    "$LAMBDA_TRUST"
+create_role_if_not_exists "stockpulse-processor-role"   "$LAMBDA_TRUST"
+create_role_if_not_exists "stockpulse-glue-role"        "$GLUE_TRUST"
+create_role_if_not_exists "stockpulse-redshift-role"    "$REDSHIFT_TRUST"
 create_role_if_not_exists "stockpulse-eventbridge-role" "$EVENTBRIDGE_TRUST"
 
 # Attach managed policies
@@ -170,23 +169,25 @@ aws iam attach-role-policy --role-name stockpulse-processor-role \
 aws iam attach-role-policy --role-name stockpulse-glue-role      \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
 
-# Inline policy: Ingester → SQS SendMessage
+KINESIS_ARN="arn:aws:kinesis:$AWS_REGION:$ACCOUNT_ID:stream/$KINESIS_STREAM"
+
+# Inline policy: Ingester → Kinesis PutRecords
 aws iam put-role-policy \
   --role-name stockpulse-ingester-role \
-  --policy-name SQSWritePolicy \
+  --policy-name KinesisPutPolicy \
   --policy-document "{
     \"Version\": \"2012-10-17\",
     \"Statement\": [{
       \"Effect\": \"Allow\",
-      \"Action\": [\"sqs:SendMessage\", \"sqs:GetQueueUrl\"],
-      \"Resource\": \"arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:$SQS_QUEUE_NAME\"
+      \"Action\": [\"kinesis:PutRecord\", \"kinesis:PutRecords\"],
+      \"Resource\": \"$KINESIS_ARN\"
     }]
   }"
 
-# Inline policy: Processor → S3 write + SQS read/delete
+# Inline policy: Processor → S3 write + Kinesis read
 aws iam put-role-policy \
   --role-name stockpulse-processor-role \
-  --policy-name S3WriteAndSQSReadPolicy \
+  --policy-name S3WriteAndKinesisReadPolicy \
   --policy-document "{
     \"Version\": \"2012-10-17\",
     \"Statement\": [
@@ -201,12 +202,13 @@ aws iam put-role-policy \
       {
         \"Effect\": \"Allow\",
         \"Action\": [
-          \"sqs:ReceiveMessage\",
-          \"sqs:DeleteMessage\",
-          \"sqs:GetQueueAttributes\",
-          \"sqs:ChangeMessageVisibility\"
+          \"kinesis:GetRecords\",
+          \"kinesis:GetShardIterator\",
+          \"kinesis:DescribeStream\",
+          \"kinesis:ListShards\",
+          \"kinesis:ListStreams\"
         ],
-        \"Resource\": \"arn:aws:sqs:$AWS_REGION:$ACCOUNT_ID:$SQS_QUEUE_NAME\"
+        \"Resource\": \"$KINESIS_ARN\"
       }
     ]
   }"
@@ -261,42 +263,44 @@ aws iam put-role-policy \
 echo "  IAM roles and policies configured."
 
 # ---------------------------------------------------------------------------
-# 3. SQS Main Queue (ingester → processor)
+# 3. Kinesis Data Stream (ingester → processor)
 # ---------------------------------------------------------------------------
 echo ""
-echo "[3/9] Creating SQS main queue..."
+echo "[3/9] Creating Kinesis Data Stream..."
 
-MAIN_QUEUE_URL=$(aws sqs create-queue \
-  --queue-name "$SQS_QUEUE_NAME" \
-  --attributes '{
-    "MessageRetentionPeriod": "86400",
-    "VisibilityTimeout": "120"
-  }' \
+if aws kinesis describe-stream-summary \
+    --stream-name "$KINESIS_STREAM" \
+    --region "$AWS_REGION" > /dev/null 2>&1; then
+  echo "  Kinesis stream '$KINESIS_STREAM' already exists — skipping"
+else
+  aws kinesis create-stream \
+    --stream-name "$KINESIS_STREAM" \
+    --shard-count 1 \
+    --region "$AWS_REGION"
+
+  echo "  Waiting for stream to become active..."
+  aws kinesis wait stream-exists \
+    --stream-name "$KINESIS_STREAM" \
+    --region "$AWS_REGION"
+
+  echo "  Created Kinesis stream: $KINESIS_STREAM"
+fi
+
+KINESIS_STREAM_ARN=$(aws kinesis describe-stream-summary \
+  --stream-name "$KINESIS_STREAM" \
   --region "$AWS_REGION" \
-  --query QueueUrl \
-  --output text 2>/dev/null || \
-  aws sqs get-queue-url \
-    --queue-name "$SQS_QUEUE_NAME" \
-    --region "$AWS_REGION" \
-    --query QueueUrl \
-    --output text)
+  --query StreamDescriptionSummary.StreamARN \
+  --output text)
 
-MAIN_QUEUE_ARN=$(aws sqs get-queue-attributes \
-  --queue-url "$MAIN_QUEUE_URL" \
-  --attribute-names QueueArn \
-  --query Attributes.QueueArn \
-  --output text \
-  --region "$AWS_REGION")
-
-aws sqs tag-queue \
-  --queue-url "$MAIN_QUEUE_URL" \
+aws kinesis add-tags-to-stream \
+  --stream-name "$KINESIS_STREAM" \
   --tags project-name=StockPulse \
-  --region "$AWS_REGION"
+  --region "$AWS_REGION" 2>/dev/null || true
 
-echo "  SQS main queue created: $MAIN_QUEUE_ARN"
+echo "  Kinesis stream ARN: $KINESIS_STREAM_ARN"
 
 # ---------------------------------------------------------------------------
-# 4. SQS Dead Letter Queue
+# 4. SQS Dead Letter Queue (Lambda processor failure destination)
 # ---------------------------------------------------------------------------
 echo ""
 echo "[4/9] Creating SQS Dead Letter Queue..."
@@ -327,14 +331,6 @@ aws sqs tag-queue \
 
 echo "  SQS DLQ created: $DLQ_ARN"
 
-# Set redrive policy on the main queue → DLQ after 3 failures
-aws sqs set-queue-attributes \
-  --queue-url "$MAIN_QUEUE_URL" \
-  --attributes "{\"RedrivePolicy\":\"{\\\"deadLetterTargetArn\\\":\\\"$DLQ_ARN\\\",\\\"maxReceiveCount\\\":\\\"3\\\"}\"}" \
-  --region "$AWS_REGION"
-
-echo "  Redrive policy set: main queue → DLQ after 3 failures."
-
 # ---------------------------------------------------------------------------
 # 5. SNS Topic for CloudWatch Alarms
 # ---------------------------------------------------------------------------
@@ -361,7 +357,7 @@ echo "[6/9] Creating CloudWatch alarms..."
 # Alarm 1: Lambda Ingester errors
 aws cloudwatch put-metric-alarm \
   --alarm-name "StockPulse-Ingester-Errors" \
-  --alarm-description "Lambda ingester has errors — check Polygon.io API key or SQS permissions" \
+  --alarm-description "Lambda ingester has errors — check Polygon.io API key or Kinesis permissions" \
   --namespace AWS/Lambda \
   --metric-name Errors \
   --dimensions Name=FunctionName,Value="$LAMBDA_INGESTER_NAME" \
@@ -392,16 +388,16 @@ aws cloudwatch put-metric-alarm \
   --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
-# Alarm 3: SQS main queue depth > 50 (processor falling behind)
+# Alarm 3: Kinesis iterator age > 60s (processor falling behind)
 aws cloudwatch put-metric-alarm \
-  --alarm-name "StockPulse-SQS-QueueDepth" \
-  --alarm-description "SQS queue depth is high — processor Lambda may be slow or throttled" \
-  --namespace AWS/SQS \
-  --metric-name ApproximateNumberOfMessagesVisible \
-  --dimensions Name=QueueName,Value="$SQS_QUEUE_NAME" \
+  --alarm-name "StockPulse-Kinesis-IteratorAge" \
+  --alarm-description "Kinesis iterator age is high — processor Lambda may be slow or throttled" \
+  --namespace AWS/Kinesis \
+  --metric-name GetRecords.IteratorAgeMilliseconds \
+  --dimensions Name=StreamName,Value="$KINESIS_STREAM" \
   --statistic Maximum \
   --period 60 \
-  --threshold 50 \
+  --threshold 60000 \
   --comparison-operator GreaterThanThreshold \
   --evaluation-periods 2 \
   --alarm-actions "$SNS_ARN" \
@@ -426,7 +422,7 @@ aws cloudwatch put-metric-alarm \
   --tags Key=project-name,Value=StockPulse \
   --region "$AWS_REGION"
 
-# Alarm 5: DLQ has messages (failed records)
+# Alarm 5: DLQ has messages (failed records from processor)
 aws cloudwatch put-metric-alarm \
   --alarm-name "StockPulse-DLQ-MessageCount" \
   --alarm-description "Records failed to process and are in the DLQ — manual investigation needed" \
@@ -464,11 +460,10 @@ echo "  Glue database: $GLUE_DB"
 echo ""
 echo "[8/9] Creating EventBridge rule (will be activated after Lambda is deployed)..."
 
-# Note: This rule is created DISABLED — enable after deploying Lambda ingester
 RULE_ARN=$(aws events put-rule \
   --name "stockpulse-ingester-schedule" \
-  --schedule-expression "cron(*/1 14-20 ? * MON-FRI *)" \
-  --description "Triggers StockPulse ingester every minute during market hours (Mon-Fri 9:30-4:00 ET / 14:30-21:00 UTC)" \
+  --schedule-expression "cron(*/5 14-20 ? * MON-FRI *)" \
+  --description "Triggers StockPulse ingester every 5 minutes during market hours (Mon-Fri 9:30-4:00 ET / 14:30-21:00 UTC)" \
   --state DISABLED \
   --region "$AWS_REGION" \
   --query RuleArn --output text 2>/dev/null) || echo "  EventBridge rule already exists — skipping"
@@ -493,24 +488,22 @@ echo ""
 echo "1. Deploy Lambda functions:"
 echo "   POLYGON_API_KEY=<your-key> ./scripts/deploy_lambda.sh"
 echo ""
-echo "2. Upload Glue script:"
-echo "   ./scripts/upload_glue_script.sh"
-echo ""
-echo "3. Subscribe to SNS alerts:"
+echo "2. Subscribe to SNS alerts:"
 echo "   aws sns subscribe --topic-arn $SNS_ARN \\"
 echo "     --protocol email --notification-endpoint you@example.com"
 echo ""
-echo "4. Provision Redshift Serverless via AWS Console:"
+echo "3. Provision Redshift Serverless via AWS Console:"
 echo "   Namespace: stockpulse-ns | Workgroup: stockpulse-wg | Base capacity: 8 RPUs"
+echo "   Then attach role: stockpulse-redshift-role"
 echo "   Then run: sql/redshift_ddl.sql"
 echo ""
-echo "5. Sign up for Grafana Cloud (free) and import grafana/dashboard.json"
+echo "4. Sign up for Grafana Cloud (free) and import grafana/dashboard.json"
 echo ""
-echo "   S3 Bucket:      s3://$S3_BUCKET"
-echo "   SQS Queue:      $MAIN_QUEUE_ARN"
-echo "   DLQ ARN:        $DLQ_ARN"
-echo "   SNS Topic:      $SNS_ARN"
-echo "   Glue DB:        $GLUE_DB"
-echo "   Region:         $AWS_REGION"
-echo "   Account ID:     $ACCOUNT_ID"
+echo "   S3 Bucket:       s3://$S3_BUCKET"
+echo "   Kinesis Stream:  $KINESIS_STREAM_ARN"
+echo "   DLQ ARN:         $DLQ_ARN"
+echo "   SNS Topic:       $SNS_ARN"
+echo "   Glue DB:         $GLUE_DB"
+echo "   Region:          $AWS_REGION"
+echo "   Account ID:      $ACCOUNT_ID"
 echo "============================================================"
