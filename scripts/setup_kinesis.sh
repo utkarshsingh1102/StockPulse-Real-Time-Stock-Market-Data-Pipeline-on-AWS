@@ -340,6 +340,29 @@ REDSHIFT_POLICY=$(aws iam list-attached-role-policies \
     && check "AmazonRedshiftDataFullAccess on loader role" "ok" "role=$LOADER_ROLE_NAME" \
     || check "AmazonRedshiftDataFullAccess on loader role" "fail" "role=$LOADER_ROLE_NAME missing policy"
 
+# Check redshift-loader workgroup env var matches actual workgroup
+ACTUAL_WG=$(aws redshift-serverless list-workgroups \
+    --region "$AWS_REGION" \
+    --query "workgroups[0].workgroupName" \
+    --output text 2>/dev/null || echo "MISSING")
+LOADER_WG=$(aws lambda get-function-configuration \
+    --function-name "stockpulse-redshift-loader" \
+    --region "$AWS_REGION" \
+    --query "Environment.Variables.REDSHIFT_WORKGROUP" \
+    --output text 2>/dev/null || echo "MISSING")
+[ "$LOADER_WG" = "$ACTUAL_WG" ] \
+    && check "Loader REDSHIFT_WORKGROUP matches actual workgroup" "ok" "$LOADER_WG" \
+    || check "Loader REDSHIFT_WORKGROUP matches actual workgroup" "fail" "loader=$LOADER_WG actual=$ACTUAL_WG"
+
+# Check GetCredentials permission on loader role
+GET_CREDS=$(aws iam get-role-policy \
+    --role-name "$LOADER_ROLE_NAME" \
+    --policy-name "RedshiftServerlessCredentials" \
+    --region "$AWS_REGION" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); print('ok')" 2>/dev/null || echo "fail")
+[ "$GET_CREDS" = "ok" ] \
+    && check "redshift-serverless:GetCredentials on loader role" "ok" "policy=RedshiftServerlessCredentials" \
+    || check "redshift-serverless:GetCredentials on loader role" "fail" "missing — run: aws iam put-role-policy --role-name $LOADER_ROLE_NAME --policy-name RedshiftServerlessCredentials"
+
 # --- Redshift Serverless ---
 echo ""
 echo "  [Redshift Serverless]"
