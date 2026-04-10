@@ -94,6 +94,16 @@ aws iam put-role-policy \
         \"Effect\": \"Allow\",
         \"Action\": \"cloudwatch:PutMetricData\",
         \"Resource\": \"*\"
+      },
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": [\"logs:FilterLogEvents\"],
+        \"Resource\": \"arn:aws:logs:$AWS_REGION:$ACCOUNT_ID:log-group:/aws/lambda/stockpulse-ingester:*\"
+      },
+      {
+        \"Effect\": \"Allow\",
+        \"Action\": \"redshift-serverless:GetCredentials\",
+        \"Resource\": \"arn:aws:redshift-serverless:$AWS_REGION:$ACCOUNT_ID:workgroup/*\"
       }
     ]
   }"
@@ -167,8 +177,8 @@ echo "[4/5] Wiring EventBridge schedule (3:45 PM ET Mon-Fri)..."
 
 aws events put-rule \
   --name "$RULE_NAME" \
-  --schedule-expression "cron(45 19 ? * MON-FRI *)" \
-  --description "StockPulse: trigger orchestrator at 3:45 PM ET daily" \
+  --schedule-expression "cron(45 15 ? * MON-FRI *)" \
+  --description "StockPulse: trigger orchestrator at 9:15 PM IST (3:45 PM ET) daily" \
   --state ENABLED \
   --region "$AWS_REGION" > /dev/null
 
@@ -212,7 +222,7 @@ echo ""
 echo "============================================================"
 echo "  Deployment complete!"
 echo ""
-echo "  Daily schedule: 3:45 PM ET (Mon-Fri)"
+echo "  Daily schedule: 9:15 PM IST / 3:45 PM ET (Mon-Fri)"
 echo "  Flow: Orchestrator → Kinesis → Ingester → S3 → [delete Kinesis]"
 echo "        → 5:00 PM Glue → 5:15 PM Redshift → Grafana"
 echo ""

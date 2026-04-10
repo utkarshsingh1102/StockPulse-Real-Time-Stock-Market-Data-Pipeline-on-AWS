@@ -33,5 +33,5 @@ DISTSTYLE KEY
 DISTKEY (symbol)
 SORTKEY (trade_date, event_time);
 
--- Grant read access to reporting user (adjust as needed)
--- GRANT SELECT ON public.ohlcv TO reporting_user;
+-- Grant access to all users (required for Redshift Data API IAM auth)
+GRANT ALL ON TABLE public.ohlcv TO PUBLIC;

@@ -1,0 +1,19 @@
+feat(orchestrator): add orchestrator Lambda for fully automated daily pipeline
+
+Replace manual ingestion steps with a single orchestrator Lambda that manages
+the complete daily sequence: create Kinesis stream → invoke ingester → wait for
+processor flush → check S3 for new data → conditionally trigger Glue → delete
+Kinesis stream.
+
+Key changes:
+- Add lambda/orchestrator/lambda_function.py with retry logic (3x), structured
+  error handling, best-effort Kinesis cleanup on failure, and CloudWatch custom
+  metrics (OrchestratorSuccess, OrchestratorFailure, GlueTriggered, GlueSkipped)
+- Glue is triggered by orchestrator only when new data is confirmed in S3 raw/
+  (files written within last 2 hours) — skipped otherwise so no stale runs
+- Deactivate stockpulse-daily-transform Glue scheduled trigger and
+  stockpulse-ingester-schedule EventBridge rule — orchestrator owns full schedule
+- Add scripts/deploy_orchestrator.sh to package, deploy, wire EventBridge cron
+  at 3:45 PM ET (Mon-Fri), and update IAM with Glue, S3, CloudWatch permissions
+- Kinesis stream lifecycle (create/delete) is now fully managed per-run,
+  eliminating ~$11/month idle cost with zero manual intervention

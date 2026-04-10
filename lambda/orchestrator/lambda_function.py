@@ -24,6 +24,7 @@ import os
 import time
 import traceback
 import boto3
+from botocore.config import Config
 
 KINESIS_STREAM        = os.environ["KINESIS_STREAM"]
 INGESTER_FUNCTION     = os.environ["INGESTER_FUNCTION"]
@@ -36,7 +37,9 @@ MAX_RETRIES           = 3
 RETRY_DELAY           = 10  # seconds between retries
 
 kinesis        = boto3.client("kinesis",    region_name=AWS_REGION)
-lambda_client  = boto3.client("lambda",     region_name=AWS_REGION)
+lambda_client  = boto3.client("lambda",     region_name=AWS_REGION,
+                   config=Config(read_timeout=300, connect_timeout=10,
+                                 retries={"max_attempts": 0}))
 cloudwatch     = boto3.client("cloudwatch", region_name=AWS_REGION)
 glue           = boto3.client("glue",       region_name=AWS_REGION)
 s3             = boto3.client("s3",         region_name=AWS_REGION)
@@ -107,23 +110,51 @@ def create_stream():
 
 
 def invoke_ingester():
-    log(f"Invoking ingester Lambda: {INGESTER_FUNCTION}")
+    """Invoke ingester asynchronously and poll CloudWatch Logs for completion."""
+    import datetime
+
+    log(f"Invoking ingester Lambda asynchronously: {INGESTER_FUNCTION}")
+    before = datetime.datetime.utcnow()
+
     response = lambda_client.invoke(
         FunctionName=INGESTER_FUNCTION,
-        InvocationType="RequestResponse",
+        InvocationType="Event",  # async — returns immediately with 202
         LogType="None",
     )
     status_code = response["StatusCode"]
-    payload = json.loads(response["Payload"].read())
+    if status_code != 202:
+        raise RuntimeError(f"Ingester async invoke returned HTTP {status_code}")
 
-    if "FunctionError" in response:
-        raise RuntimeError(f"Ingester Lambda function error: {payload}")
+    log("Ingester invoked — polling for completion (max 300s)...")
 
-    if status_code != 200:
-        raise RuntimeError(f"Ingester Lambda returned HTTP {status_code}: {payload}")
+    logs_client = boto3.client("logs", region_name=AWS_REGION)
+    log_group = "/aws/lambda/stockpulse-ingester"
+    start_ms = int(before.timestamp() * 1000)
 
-    log(f"Ingester completed — response={payload}")
-    return payload
+    for attempt in range(60):  # poll every 5s for up to 300s
+        time.sleep(5)
+        try:
+            response = logs_client.filter_log_events(
+                logGroupName=log_group,
+                startTime=start_ms,
+                filterPattern="REPORT RequestId",
+            )
+            events = response.get("events", [])
+            if events:
+                log(f"Ingester completed (detected via CloudWatch Logs after {(attempt+1)*5}s)")
+                # Check for error in the same timeframe
+                err_response = logs_client.filter_log_events(
+                    logGroupName=log_group,
+                    startTime=start_ms,
+                    filterPattern="ERROR",
+                )
+                if err_response.get("events"):
+                    raise RuntimeError("Ingester Lambda reported errors — check /aws/lambda/stockpulse-ingester logs")
+                return
+        except logs_client.exceptions.ResourceNotFoundException:
+            pass  # log group not created yet — ingester hasn't started
+
+    raise RuntimeError("Ingester did not complete within 300s.")
 
 
 def has_new_data():
