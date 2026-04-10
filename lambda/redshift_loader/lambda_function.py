@@ -19,7 +19,9 @@ DB_USER        = os.environ.get("REDSHIFT_DB_USER", "admin")
 S3_PATH        = os.environ.get("S3_PROCESSED_PATH", "s3://stockpulse-data-us2/processed/")
 IAM_ROLE       = os.environ.get("REDSHIFT_IAM_ROLE", "arn:aws:iam::985823270443:role/stockpulse-redshift-role")
 
-COPY_SQL = f"""
+TRUNCATE_AND_COPY_SQL = f"""
+TRUNCATE TABLE public.ohlcv;
+
 COPY public.ohlcv (
     symbol,
     "open",
@@ -49,14 +51,14 @@ redshift_data = boto3.client("redshift-data")
 
 
 def lambda_handler(event, context):
-    print(f"Triggering Redshift COPY from {S3_PATH}")
+    print(f"Triggering Redshift TRUNCATE + COPY from {S3_PATH}")
     print(f"Glue event: {json.dumps(event)}")
 
-    # Execute COPY via Redshift Data API (async)
+    # Execute TRUNCATE + COPY as a single transaction via Redshift Data API
     response = redshift_data.execute_statement(
         WorkgroupName=WORKGROUP_NAME,
         Database=DATABASE,
-        Sql=COPY_SQL,
+        Sql=TRUNCATE_AND_COPY_SQL,
     )
 
     statement_id = response["Id"]

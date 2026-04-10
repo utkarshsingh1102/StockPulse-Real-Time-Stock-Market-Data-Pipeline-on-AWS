@@ -152,6 +152,34 @@ SHARD_COUNT=$(aws kinesis describe-stream-summary \
     && check "Kinesis stream: $KINESIS_STREAM" "ok" "ACTIVE | shards=$SHARD_COUNT" \
     || check "Kinesis stream: $KINESIS_STREAM" "fail" "status=$STREAM_STATE"
 
+# --- Lambda: orchestrator ---
+echo ""
+echo "  [Lambda: Orchestrator]"
+ORCH_STATE=$(aws lambda get-function \
+    --function-name "stockpulse-orchestrator" \
+    --region "$AWS_REGION" \
+    --query "Configuration.State" \
+    --output text 2>/dev/null || echo "MISSING")
+[ "$ORCH_STATE" = "Active" ] \
+    && check "stockpulse-orchestrator exists" "ok" "State=Active" \
+    || check "stockpulse-orchestrator exists" "fail" "State=$ORCH_STATE — run deploy_orchestrator.sh"
+
+ORCH_LAST_RUN=$(aws logs describe-log-streams \
+    --log-group-name "/aws/lambda/stockpulse-orchestrator" \
+    --region "$AWS_REGION" \
+    --order-by LastEventTime \
+    --descending \
+    --max-items 1 \
+    --query "logStreams[0].lastEventTimestamp" \
+    --output text 2>/dev/null || true)
+if [ -n "$ORCH_LAST_RUN" ] && [ "$ORCH_LAST_RUN" != "None" ] && [ "$ORCH_LAST_RUN" != "null" ]; then
+    TS_SEC=$(( ORCH_LAST_RUN / 1000 ))
+    LAST_RUN_DATE=$(date -r "$TS_SEC" '+%Y-%m-%d %H:%M UTC' 2>/dev/null || echo "ts=$ORCH_LAST_RUN")
+    check "Orchestrator last ran" "ok" "$LAST_RUN_DATE"
+else
+    check "Orchestrator last ran" "ok" "no runs yet (expected on first deploy)"
+fi
+
 # --- Lambda: ingester ---
 echo ""
 echo "  [Lambda: Ingester]"
@@ -173,25 +201,28 @@ INGESTER_STREAM=$(aws lambda get-function-configuration \
     && check "Ingester env KINESIS_STREAM_NAME" "ok" "$INGESTER_STREAM" \
     || check "Ingester env KINESIS_STREAM_NAME" "fail" "got=$INGESTER_STREAM expected=$KINESIS_STREAM"
 
-INGESTER_SCHEDULE=$(aws events list-targets-by-rule \
-    --rule "stockpulse-ingester-schedule" \
+ORCH_TARGET=$(aws events list-targets-by-rule \
+    --rule "stockpulse-orchestrator-schedule" \
     --region "$AWS_REGION" \
-    --query "Targets[?contains(Arn, 'stockpulse-ingester')].Arn" \
+    --query "Targets[?contains(Arn, 'stockpulse-orchestrator')].Arn" \
     --output text 2>/dev/null || echo "")
-[ -n "$INGESTER_SCHEDULE" ] \
-    && check "EventBridge → ingester wired" "ok" "rule=stockpulse-ingester-schedule" \
-    || check "EventBridge → ingester wired" "fail" "no target found"
+[ -n "$ORCH_TARGET" ] \
+    && check "Orchestrator wired to EventBridge" "ok" "rule=stockpulse-orchestrator-schedule" \
+    || check "Orchestrator wired to EventBridge" "fail" "no target found — run deploy_orchestrator.sh"
 
-INGESTER_RULE_STATE=$(aws events describe-rule \
-    --name "stockpulse-ingester-schedule" \
+ORCH_RULE_STATE=$(aws events describe-rule \
+    --name "stockpulse-orchestrator-schedule" \
     --region "$AWS_REGION" \
     --query "State" \
     --output text 2>/dev/null || echo "MISSING")
-[ "$INGESTER_RULE_STATE" = "ENABLED" ] \
-    && check "Ingester EventBridge rule enabled" "ok" "ENABLED" \
-    || { [ "$INGESTER_RULE_STATE" = "DISABLED" ] \
-        && check "Ingester EventBridge rule enabled" "fail" "DISABLED — run: aws events enable-rule --name stockpulse-ingester-schedule" \
-        || check "Ingester EventBridge rule enabled" "fail" "state=$INGESTER_RULE_STATE"; }
+ORCH_SCHEDULE=$(aws events describe-rule \
+    --name "stockpulse-orchestrator-schedule" \
+    --region "$AWS_REGION" \
+    --query "ScheduleExpression" \
+    --output text 2>/dev/null || echo "")
+[ "$ORCH_RULE_STATE" = "ENABLED" ] \
+    && check "Orchestrator EventBridge rule enabled" "ok" "ENABLED | $ORCH_SCHEDULE" \
+    || check "Orchestrator EventBridge rule enabled" "fail" "State=$ORCH_RULE_STATE"
 
 # --- Lambda: processor ---
 echo ""
@@ -211,9 +242,11 @@ ESM_STATE=$(aws lambda list-event-source-mappings \
     --region "$AWS_REGION" \
     --query "EventSourceMappings[0].State" \
     --output text 2>/dev/null || echo "MISSING")
-[ "$ESM_STATE" = "Enabled" ] \
-    && check "Kinesis → processor ESM" "ok" "State=Enabled" \
-    || check "Kinesis → processor ESM" "fail" "State=$ESM_STATE"
+# ESM is Disabled when Kinesis stream doesn't exist (orchestrator manages lifecycle)
+# Only flag as fail if the mapping itself is completely missing
+[ "$ESM_STATE" = "Enabled" ] || [ "$ESM_STATE" = "Disabled" ] \
+    && check "Kinesis → processor ESM" "ok" "State=$ESM_STATE (normal — orchestrator manages stream lifecycle)" \
+    || check "Kinesis → processor ESM" "fail" "State=$ESM_STATE — mapping missing, re-run this script"
 
 PROCESSOR_BUCKET=$(aws lambda get-function-configuration \
     --function-name "stockpulse-processor" \
@@ -257,14 +290,10 @@ TRIGGER_STATE=$(aws glue get-trigger \
     --region "$AWS_REGION" \
     --query "Trigger.State" \
     --output text 2>/dev/null || echo "MISSING")
-TRIGGER_SCHEDULE=$(aws glue get-trigger \
-    --name "stockpulse-daily-transform" \
-    --region "$AWS_REGION" \
-    --query "Trigger.Schedule" \
-    --output text 2>/dev/null || echo "")
-[ "$TRIGGER_STATE" = "ACTIVATED" ] \
-    && check "Glue trigger: stockpulse-daily-transform" "ok" "ACTIVATED | $TRIGGER_SCHEDULE" \
-    || check "Glue trigger: stockpulse-daily-transform" "fail" "State=$TRIGGER_STATE"
+# Glue scheduled trigger is intentionally DEACTIVATED — orchestrator triggers Glue directly
+[ "$TRIGGER_STATE" = "DEACTIVATED" ] || [ "$TRIGGER_STATE" = "MISSING" ] \
+    && check "Glue scheduled trigger deactivated" "ok" "orchestrator triggers Glue directly" \
+    || check "Glue scheduled trigger deactivated" "fail" "State=$TRIGGER_STATE — should be DEACTIVATED"
 
 GLUE_LAST_RUN=$(aws glue get-job-runs \
     --job-name "stockpulse-ohlcv-transform" \
