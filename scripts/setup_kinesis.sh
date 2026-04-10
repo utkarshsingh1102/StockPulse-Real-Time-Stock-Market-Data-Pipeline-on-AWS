@@ -344,13 +344,13 @@ REDSHIFT_POLICY=$(aws iam list-attached-role-policies \
 echo ""
 echo "  [Redshift Serverless]"
 RS_WG=$(aws redshift-serverless get-workgroup \
-    --workgroup-name "stockpulse-wg" \
+    --workgroup-name "stockpulse-wq" \
     --region "$AWS_REGION" \
     --query "workgroup.status" \
-    --output text 2>/dev/null || echo "MISSING")
+    --output text 2>/dev/null | tr -d '[:space:]' || echo "MISSING")
 [ "$RS_WG" = "AVAILABLE" ] \
-    && check "Redshift workgroup: stockpulse-wg" "ok" "AVAILABLE" \
-    || check "Redshift workgroup: stockpulse-wg" "fail" "status=$RS_WG"
+    && check "Redshift workgroup: stockpulse-wq" "ok" "$RS_WG" \
+    || check "Redshift workgroup: stockpulse-wq" "fail" "status=$RS_WG"
 
 RS_NS=$(aws redshift-serverless get-namespace \
     --namespace-name "stockpulse-ns" \
